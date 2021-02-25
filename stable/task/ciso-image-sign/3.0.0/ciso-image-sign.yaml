@@ -324,14 +324,16 @@ spec:
               dir:/image-storage \
               --dest-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}" \
               --src-creds iamapikey:"$IBM_CLOUD_API_KEY"
+
+
           echo "show image"
-          ls /image-storage
+          #ls /image-storage
           cp -p /signing-files/artifactory.yaml  /etc/containers/registries.d/artifactory.yaml
           cp -p /signing-files/policy.json /etc/containers/policy.json
           echo "************************"
           echo "artifactory yaml & policy json"
-          cat /etc/containers/registries.d/artifactory.yaml
-          cat /etc/containers/policy.json
+          #cat /etc/containers/registries.d/artifactory.yaml
+          #cat /etc/containers/policy.json
           echo "Generating PFX file from secret"
           echo -n "${VAULT_SECRET}" | base64 --decode > /signing-files/temp.pfx
           chmod 644 /signing-files/temp.pfx
@@ -362,7 +364,7 @@ spec:
           FINGERPRINT=$(echo $FINGERPRINT | head -n1 | sed -e 's/\s.*$//')
           gpg2 --armor --output ${PUBLIC_KEY_FILE} --export ${FINGERPRINT}
 
-          ls /image-storage
+          #ls /image-storage
           skopeo copy \
               dir:/image-storage \
               docker://"${IMAGE}" \
