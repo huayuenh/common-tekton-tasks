@@ -316,6 +316,8 @@ spec:
 
           source /steps/next-step-env.properties
           echo "copying images"
+          ls /image-storage
+          echo "docker://${IMAGE}"
           skopeo copy \
               docker://"${IMAGE}" \
               dir:/image-storage \
