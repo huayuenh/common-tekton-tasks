@@ -315,6 +315,7 @@ spec:
           fi
 
           source /steps/next-step-env.properties
+          export IBM_CLOUD_API_KEY=$(cat "/secrets/$(params.toolchain-apikey-secret-key)")
           echo "copying images"
           ls /image-storage
           echo "docker://${IMAGE}"
@@ -322,7 +323,7 @@ spec:
               docker://"${IMAGE}" \
               dir:/image-storage \
               --dest-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}" \
-              --src-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}"
+              --src-creds iamapikey:"$IBM_CLOUD_API_KEY"
           echo "show image"
           ls /image-storage
           cp -p /signing-files/artifactory.yaml  /etc/containers/registries.d/artifactory.yaml
