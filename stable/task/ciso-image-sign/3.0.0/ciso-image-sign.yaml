@@ -383,6 +383,8 @@ spec:
 
           # Create a zip file containing only the file structure within the staging sigstore
           cd /var/lib/containers/sigstore/; zip -r /tmp/upload-sig-to-artifactory.zip ./*; cd -
+          ls -a /var/lib/containers/sigstore
+
           # Upload the zip file to Artifactory and explode it to replicate the same structure
           jfrog rt u --explode --user "${ARTIFACTORY_USER}" --apikey "${ARTIFACTORY_API_KEY}" --url "${ARTIFACTORY_BASE_URL}" "/tmp/upload-sig-to-artifactory.zip" "${ARTIFACTORY_SIGSTORE_REPO_NAME}"
 
