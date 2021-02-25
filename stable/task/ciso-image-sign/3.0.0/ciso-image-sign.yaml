@@ -237,7 +237,8 @@ spec:
       script: |
           #!/bin/bash
           set +e
-
+          echo "ARTIFACTORY_DOCKER_REPO_NAME $ARTIFACTORY_DOCKER_REPO_NAME"
+          echo "ARTIFACTORY_SIGSTORE_REPO_NAME $ARTIFACTORY_SIGSTORE_REPO_NAME"
           if [[ "$ARTIFACTORY_SIGNING" -eq 0 ]]; then
             echo "Step skipped."
             exit 0;
@@ -268,6 +269,10 @@ spec:
           echo "ARTIFACTORY_BASE_URL=${ARTIFACTORY_BASE_URL}" >> /steps/next-step-env.properties
           echo "ARTIFACTORY_SIGSTORE_REPO_URL=${ARTIFACTORY_SIGSTORE_REPO_URL}" >> /steps/next-step-env.properties
           echo "PUBLIC_KEY_FILE=${PUBLIC_KEY_FILE}" >> /steps/next-step-env.properties
+          echo "ARTIFACTORY_DOCKER_REPO_URL $ARTIFACTORY_DOCKER_REPO_URL"
+          echo "ARTIFACTORY_BASE_URL $ARTIFACTORY_BASE_URL"
+          echo "ARTIFACTORY_SIGSTORE_REPO_URL $ARTIFACTORY_SIGSTORE_REPO_URL"
+          echo "PUBLIC_KEY_FILE $PUBLIC_KEY_FILE"
 
     - name: artifactory-sign-image
       image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/code-signing-agent:1.0.0@sha256:1a77f8002ff5e0f35bfaab52ed1dd93b1ca2277987e7dd5941b64afa3527451d
