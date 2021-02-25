@@ -1,0 +1,276 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: servicenow-create-change-request
+  labels:
+    tekton.dev/deprecated: true
+    app.kubernetes.io/version: "2.0.1"
+spec:
+  params:
+    - name: servicenow-api-url
+      description: The ServiceNow API URL you wish to use
+    - name: continuous-delivery-context-secret
+      descriptiom: Reference name for the secret resource
+      default: "secure-properties"
+    - name: servicenow-api-token-secret-key
+      description: ServiceNow api token name
+      default: "servicenow-api-token"
+    - name: change-request-id
+      description: optional ServiceNow Change Request ID
+      default: "notAvailable"
+    - name: change-request-url
+      description: direct url to the newly created change request without the change request id
+    - name: cr-json-path
+      description: path of the JSON file containing all the required information for a CR
+      default: ""
+    - name: servicenow-configuration-item
+      description: The name of the service to be deployed as it is registered in ServiceNow
+      default: ""
+    - name: servicenow-assigned-to
+      default: ""
+    - name: servicenow-description
+      default: ""
+    - name: servicenow-purpose
+      default: ""
+    - name: servicenow-impact
+      default: ""
+    - name: servicenow-backout-plan
+      default: ""
+    - name: servicenow-region-id
+      default: ""
+    - name: servicenow-priority
+      default: "Low"
+    - name: servicenow-outage-duration
+      default: ""
+    - name: servicenow-deployment-ready
+      default: "yes"
+    - name: servicenow-type
+      default: standard
+    - name: servicenow-planned-start
+      default: ""
+    - name: servicenow-planned-end
+      default: ""
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  results:
+    - name: change-request-id
+      description: The created ServiceNow Change Request ID
+    - name: change-request-url
+      description: The created ServiceNow Change Request URL
+    - name: exit-code
+      description: The exit-code of the script
+    - name: status
+      description: The status based on exit-code
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  steps:
+    - name: check-deployment-readiness
+      image: ibmcom/pipeline-base-image:2.7@sha256:282677e79ccb9d20c699d384a54093894de03675752cd848a3133266c898c14c
+      workingDir: $(workspaces.artifacts.path)
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+      env:
+        - name: CHANGE_REQUEST_JSON_PATH
+          value: $(params.cr-json-path)
+      script: |
+        #!/bin/bash
+
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        # saving this here, as the compliance baseimage has no jq :/
+
+        if [[ "$CHANGE_REQUEST_JSON_PATH" ]]; then
+          DEPLOYMENT_READY=$(jq '.deploymentready' "$(workspaces.artifacts.path)/${CHANGE_REQUEST_JSON_PATH}")
+          PULL_REQUEST_TYPE=$(jq -r '.type' "$(workspaces.artifacts.path)/${CHANGE_REQUEST_JSON_PATH}")
+
+          json=$(cat "$(workspaces.artifacts.path)/${CHANGE_REQUEST_JSON_PATH}")
+
+          if [[ "${PULL_REQUEST_TYPE}" == "emergency" ]]; then
+            DEPLOYMENT_READY="yes"
+
+            json="$(echo $json | jq -c \
+              --arg deploymentready "$DEPLOYMENT_READY" \
+              '.deploymentready = $deploymentready')"
+          fi
+
+          echo "${DEPLOYMENT_READY}" >> /steps/cr-json-deploymentready
+
+          #
+          # if the JSON is missing the deployment window, lets add one
+          # just after we create the CR but not too far, so the approval check
+          # won't complain about missing the window
+          #
+
+          has_plannedstart=$(echo $json | jq -r '.plannedstart // ""')
+          has_plannedend=$(echo $json | jq -r '.plannedend // ""')
+
+          if [ -z $has_plannedstart ] && [ -z $has_plannedend ]; then
+            PLANNED_START="$(date --utc -d 'today + 1 min' '+%F %T')"
+            PLANNED_END="$(date --utc -d 'today + 2 hour' '+%F %T')"
+
+            json="$(echo $json | jq -c \
+              --arg plannedstart "$PLANNED_START" \
+              --arg plannedend "$PLANNED_END" \
+              '.plannedstart = $plannedstart | .plannedend = $plannedend')"
+
+            echo -n $json > "$(workspaces.artifacts.path)/${CHANGE_REQUEST_JSON_PATH}"
+          fi
+        fi
+
+    - name: create-change-request
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.0.3@sha256:6acbd2908813ddb3ab3cd9a77ead61fd2fa69c66d437c571ec7ffc3ebb426196
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+        - mountPath: /steps
+          name: steps-volume
+      workingDir: $(workspaces.artifacts.path)
+      env:
+        - name: SERVICENOW_URL
+          value: $(params.servicenow-api-url)
+        - name: CHANGE_REQUEST_ID
+          value: $(params.change-request-id)
+        - name: CHANGE_REQUEST_JSON_PATH
+          value: $(params.cr-json-path)
+        - name: SERVICENOW_DEPLOYMENT_READY
+          value: $(params.servicenow-deployment-ready)
+        - name: SERVICENOW_CONFIGURATION_ITEM
+          value: $(params.servicenow-configuration-item)
+        - name: SERVICENOW_ASSIGNED_TO
+          value: $(params.servicenow-assigned-to)
+        - name: SERVICENOW_DESCRIPTION
+          value: $(params.servicenow-description)
+        - name: SERVICENOW_PURPOSE
+          value: $(params.servicenow-purpose)
+        - name: SERVICENOW_IMPACT
+          value: $(params.servicenow-impact)
+        - name: SERVICENOW_BACKOUT_PLAN
+          value: $(params.servicenow-backout-plan)
+        - name: SERVICENOW_REGION_ID
+          value: $(params.servicenow-region-id)
+        - name: SERVICENOW_PRIORITY
+          value: $(params.servicenow-priority)
+        - name: SERVICENOW_OUTAGE_DURATION
+          value: $(params.servicenow-outage-duration)
+        - name: SERVICENOW_TYPE
+          value: $(params.servicenow-type)
+        - name: SERVICENOW_PLANNED_START
+          value: $(params.servicenow-planned-start)
+        - name: SERVICENOW_PLANNED_END
+          value: $(params.servicenow-planned-end)
+        - name: PIPELINE_RUN_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+      script: |
+        #!/bin/bash
+
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        if [ -n "$CHANGE_REQUEST_ID" ] && [ "$CHANGE_REQUEST_ID" != "notAvailable" ]; then
+          CHANGE_REQUEST_URL="$(params.change-request-url)$CHANGE_REQUEST_ID"
+
+          echo "Using the provided Change Request ID"
+          echo "Change Request ID: $CHANGE_REQUEST_ID"
+          echo "Change Request URL: $CHANGE_REQUEST_URL"
+
+          # Record task results
+          echo -n "${CHANGE_REQUEST_ID}" > $(results.change-request-id.path)
+          echo -n "${CHANGE_REQUEST_URL}" > $(results.change-request-url.path)
+          echo -n success | tee $(results.status.path)
+          echo 0 | tee $(results.exit-code.path)
+
+          exit 0
+        fi
+
+        export SERVICENOW_TOKEN=$(cat "/secrets/$(params.servicenow-api-token-secret-key)")
+
+        SERVICENOW_TOKEN="${SERVICENOW_TOKEN}"
+        SERVICENOW_URL="${SERVICENOW_URL}"
+
+        if [[ "$CHANGE_REQUEST_JSON_PATH" ]]; then
+          export CHANGE_REQUEST_JSON_PATH="$(workspaces.artifacts.path)/${CHANGE_REQUEST_JSON_PATH}"
+          export SERVICENOW_DEPLOYMENT_READY="$(cat /steps/cr-json-deploymentready)"
+        fi
+
+        PARAMS=""
+
+        if [ "$CHANGE_REQUEST_JSON_PATH" ]; then
+          PARAMS="--file \"$CHANGE_REQUEST_JSON_PATH\""
+        else
+          PARAMS="--system=\"${SERVICENOW_CONFIGURATION_ITEM}\" \
+          --assigned-to=\"${SERVICENOW_ASSIGNED_TO}\" \
+          --impact=\"${SERVICENOW_IMPACT}\" \
+          --outage-duration=\"${SERVICENOW_OUTAGE_DURATION}\" \
+          --priority=\"${SERVICENOW_PRIORITY}\" \
+          --environment=\"${SERVICENOW_REGION_ID}\" \
+          --purpose=\"${SERVICENOW_PURPOSE}\" \
+          --description=\"${SERVICENOW_DESCRIPTION}\" \
+          --backout-plan=\"${SERVICENOW_BACKOUT_PLAN}\" \
+          --planned-start=\"${SERVICENOW_PLANNED_START}\" \
+          --planned-end=\"${SERVICENOW_PLANNED_END}\" \
+          --deployment-ready=\"${SERVICENOW_DEPLOYMENT_READY}\" \
+          --type=\"${SERVICENOW_TYPE}\" \
+          --evidence-summary=\"${EVIDENCE_SUMMARY}\""
+        fi
+
+        CHANGE_REQUEST_ID=$(cocoa change-request create $PARAMS)
+
+        if [[ "$SERVICENOW_DEPLOYMENT_READY" == "no" ]]; then
+          echo "Created CR deployment ready state is marked as \"no\", requesting approval..."
+          cocoa change-request request-approval \
+            --change-request-id="$CHANGE_REQUEST_ID"
+        fi;
+
+        exit_code=$?
+
+        echo $exit_code | tee $(results.exit-code.path)
+
+        if [ $exit_code -eq 0 ]; then
+          echo -n success | tee $(results.status.path)
+        else
+          echo "Error creating CR"
+          echo -n failure | tee $(results.status.path)
+        fi
+
+        CHANGE_REQUEST_URL="$(params.change-request-url)$CHANGE_REQUEST_ID"
+
+        echo "Change request ID: $CHANGE_REQUEST_ID"
+        echo "Change request URL: $CHANGE_REQUEST_URL"
+
+        # Record task results
+        echo -n "${CHANGE_REQUEST_ID}" > $(results.change-request-id.path)
+        echo -n "${CHANGE_REQUEST_URL}" > $(results.change-request-url.path)
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+
+  volumes:
+    - name: steps-volume
+      emptyDir: {}
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)

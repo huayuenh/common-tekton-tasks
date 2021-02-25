@@ -1,0 +1,94 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: ciso-extract-key
+spec:
+  params:
+    - name: continuous-delivery-context-secret
+      description: name of the configmap containing the continuous delivery pipeline context secrets
+      default: secure-properties
+    - name: toolchain-apikey-secret-key
+      description: field in the secret that contains the api key used to login to ibmcloud kubernetes service
+      default: api-key
+    - name: vault-secret
+      default: vault-secret
+    - name: region
+    - name: resource-group
+    - name: ibmcloud-api
+      description: the ibmcloud api
+      default: https://cloud.ibm.com
+  steps:
+    - name: extract-public-key
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/csso-image-sign:1.0.0
+      env:
+        - name: IBM_CLOUD_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.toolchain-apikey-secret-key)
+        - name: VAULT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.vault-secret)
+        - name: IBMCLOUD_TARGET_REGION
+          value: $(params.region)
+        - name: RESOURCE_GROUP
+          value: $(params.resource-group)
+        - name: API
+          value: $(params.ibmcloud-api)
+      # yamllint disable rule:line-length
+      script: |
+          #!/bin/bash
+          #Required parameters
+          #VAULT_INSTANCE - name of the Key-Protect instance
+          #KEY_NAME - name of the key entry in Key-Protect key name must match CSSO cert name
+          #RESOURCE_GROUP - "Default" by default. Resource Group of Key-Protect
+          #IBM_CLOUD_API_KEY - access ibm cloud apikey
+          # if registry region is in the 'ibm:yp:<region>' just keep the region part
+          export IBMCLOUD_TARGET_REGION=$(echo "${IBMCLOUD_TARGET_REGION}" | awk -F ":" '{print $NF}')
+          ibmcloud login -a ${API} --apikey ${IBM_CLOUD_API_KEY} -r ${IBMCLOUD_TARGET_REGION};
+          ibmcloud target -r ${IBMCLOUD_TARGET_REGION}
+
+          #echo "RESOURCE_GROUP $RESOURCE_GROUP"
+          #echo "IBM_CLOUD_API_KEY $IBM_CLOUD_API_KEY"
+
+          export secret=$VAULT_SECRET
+          KEY_NAME="temp.pfx"
+          export filename=${KEY_NAME}
+
+          #create python script for decoding base64 binary file
+          #handles binary data better than bash
+          cat << EOF > decode.py
+          #!/usr/bin/env python
+          import base64
+          import os
+          inputdata=os.environ["secret"]
+          outputname=os.environ["filename"]
+          result=base64.b64decode(inputdata)
+          f=open(outputname, 'wb')
+          f.write(result)
+          EOF
+
+          chmod 755 ./decode.py
+          echo "RESTORING KEY DATA"
+          python3 ./decode.py
+          mv ./$KEY_NAME /etc/ekm
+
+          #extract alias
+          ALIAS=$(ucl list | grep Private)
+          ALIAS=${ALIAS#*"Name="}
+          ALIAS="${ALIAS//\"}"
+
+          gpgconf --kill all
+          ucl pgp-key -n ${ALIAS}
+
+          gpg --export --armour > key.asc
+          cat key.asc
+
+      # yamllint enable rule:line-length
+  workspaces:
+    - name: artifacts
+      description: A workspace backing by a volume
+      mountPath: /artifacts

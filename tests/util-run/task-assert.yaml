@@ -1,0 +1,24 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: assert-util-run
+spec:
+  params:
+    - name: exit-code
+    - name: status
+
+  steps:
+    - name: assert-util-run-results
+      image: ibmcom/pipeline-base-image:2.6
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e -o pipefail;
+
+          if [[ "$(params.status)" == "success" && $(params.exit-code) -eq 0 ]]; then
+            echo "Test passed!"
+          else
+            echo "Test failed!"
+            exit 1
+          fi

@@ -1,0 +1,104 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: gitsecure-cis-check
+spec:
+  params:
+    - name: repository
+      description: the git repo
+    - name: revision
+      description: the revision
+      default: master
+    - name: commit-id
+      description: git commit id
+    - name: pr-url
+      description: pull request html url
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: project-id
+      description: for gitlab repository specify project-id
+      default: ""
+    - name: git-api-token-key
+      description: The name of the secret in the workspace
+      default: "git-token"
+    - name: directory-name
+      description: directory name where the repository is cloned
+
+  results:
+    - name: status
+      description: status of gitsecure cis task, possible value are-success|failure
+    - name: evidence-store
+      description: filepath to store cis task evidence
+  stepTemplate:
+    env:
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+  steps:
+    - name: cis
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/gitsecure/cis-task:2.0.0
+      imagePullPolicy: Always
+      workingDir: "/artifacts"
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          #!/bin/sh
+
+          REPO_DIR_PATH="/artifacts/$(params.directory-name)"
+
+          /usr/local/bin/deploy-analytic \
+            -giturl "$(params.repository)" \
+            -gitbranch "$(params.revision)" \
+            -repodir $REPO_DIR_PATH \
+            -apiservice https://apiservice-dal.gitsecureapi.com \
+            -runid "$PIPELINE_RUN_ID" \
+            -commitid "$(params.commit-id)" \
+            -results_status "$(results.status.path)" \
+            -results_evidence "./gitsecure-cis-results.json" \
+            -comment_md "./gitsecure-cis-comment.md"
+
+          echo -n "gitsecure-cis-results.json" > $(results.evidence-store.path)
+          echo "COMMENT_FP=./gitsecure-cis-comment.md" >> /steps/next-step-env.properties
+
+      volumeMounts:
+        - name: steps-volume
+          mountPath: /steps
+
+    - name: comment-editor
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/gitsecure/gitsecure-comm-editor:2.0.0
+      imagePullPolicy: Always
+      workingDir: "/artifacts"
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          #!/bin/sh
+          source /steps/next-step-env.properties
+
+          GIT_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+          /usr/local/bin/comm-editor \
+            -repo-url "$(params.repository)" \
+            -pr-url "$(params.pr-url)" \
+            -token "$GIT_TOKEN" \
+            -comment-fp "$COMMENT_FP" \
+            -project-id "$(params.project-id)"
+
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: steps-volume
+      emptyDir: {}
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)

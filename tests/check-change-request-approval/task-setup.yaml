@@ -1,0 +1,19 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: setup-check-change-request-approval
+spec:
+  params:
+    - name: change-request-id
+
+  results:
+    - name: change-request-id
+
+  steps:
+    - name: setup
+      image: ibmcom/pipeline-base-image:2.6
+      script: |
+        #!/usr/bin/env bash
+
+        echo -n $(params.change-request-id) > $(results.change-request-id.path)

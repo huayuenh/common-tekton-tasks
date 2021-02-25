@@ -1,0 +1,44 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline-evidence-summarize
+spec:
+  workspaces:
+    - name: evidence-locker
+  params:
+    - name: evidence-repo-path
+    - name: toolchain-crn
+    - name: path-list
+    - name: pipeline-debug
+    - name: evidence-locker
+    - name: ghe-token
+  tasks:
+    - name: setup
+      taskRef:
+        name: setup-evidence-locker-repo
+      workspaces:
+        - name: evidence-locker
+          workspace: evidence-locker
+      params:
+        - name: ghe-token
+          value: $(params.ghe-token)
+        - name: evidence-locker
+          value: $(params.evidence-locker)
+    - name: evidence-summarize-task
+      runAfter:
+        - setup
+      taskRef:
+        name: evidence-summarize
+      workspaces:
+        - name: evidence-locker
+          workspace: evidence-locker
+      params:
+        - name: evidence-repo-path
+          value: $(params.evidence-repo-path)
+        - name: path-list
+          value: $(params.path-list)
+        - name: toolchain-crn
+          value: $(params.toolchain-crn)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)

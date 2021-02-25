@@ -1,0 +1,30 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline-close-change-request
+spec:
+  params:
+    - name: change-request-id
+    - name: pipeline-debug
+
+  tasks:
+    - name: setup
+      taskRef:
+        name: setup-close-change-request
+      params:
+        - name: change-request-id
+          value: $(params.change-request-id)
+
+    - name: pipeline-close-cr
+      taskRef:
+        name: servicenow-close-change-request
+      runAfter:
+        - setup
+      params:
+        - name: servicenow-api-url
+          value: "https://watsontest.service-now.com/api/ibmwc/change"
+        - name: change-request-id
+          value: $(tasks.setup.results.change-request-id)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)

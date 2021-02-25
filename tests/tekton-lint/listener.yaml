@@ -1,0 +1,11 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: listener-tekton-lint
+spec:
+  triggers:
+    - binding:
+        name: binding-tekton-lint
+      template:
+        name: template-tekton-lint

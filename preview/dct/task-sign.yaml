@@ -1,0 +1,162 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: dct-sign
+spec:
+  params:
+    - name: app-name
+      description: The name of your app
+    - name: validation-signer
+      description: current signer
+    - name: registry-namespace
+      description: The registry namespace
+    - name: registry-region
+      description: the registry region
+    - name: image-tag
+      description: tag of the created image
+    - name: vault-name
+      description: the key protect instance name
+    - name: resource-group
+      description: the resource group
+    - name: cluster-name
+      description: the name of the targeted cluster
+    - name: region
+      description: target region
+    - name: api-endpoint
+      description: api endpoint
+      default: https://cloud.ibm.com
+    - name: working-dir
+      default: "/root"
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: ibmcloud-api-key-secret-key
+      description: the IBM Cloud API key from secrets
+      default: "ibmcloud-api-key"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  steps:
+    - name: sign-image
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      env:
+        - name: API
+          value: $(params.api-endpoint)
+        - name: HOME
+          value: $(params.working-dir)
+        - name: REGISTRY_NAMESPACE
+          value: $(params.registry-namespace)
+        - name: VAULT_INSTANCE
+          value: $(params.vault-name)
+        - name: DEVOPS_SIGNER
+          value: $(params.validation-signer)
+        - name: IBMCLOUD_TARGET_RESOURCE_GROUP
+          value: $(params.resource-group)
+        - name: REGISTRY_REGION
+          value: $(params.registry-region)
+        - name: IBMCLOUD_TARGET_REGION
+          value: $(params.region)
+        - name: BUILD_CLUSTER
+          value: $(params.cluster-name)
+        - name: IMAGE_NAME
+          value: $(params.app-name)
+        - name: IMAGE_TAG
+          value: $(params.image-tag)
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          #!/bin/bash
+
+          if [ $PIPELINE_DEBUG == 1 ]; then
+           pwd
+           env
+           trap env EXIT
+           set -x
+          fi
+
+          export IBM_CLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+
+          source /scripts/retry_command.sh
+
+          dct_sign() {
+
+            source <(curl -sSL "https://raw.githubusercontent.com/open-toolchain/commons/master/scripts/image_signing/add_docker.sh")
+            source <(curl -s -S -L "https://raw.githubusercontent.com/open-toolchain/commons/master/scripts/setup_dind.sh")
+
+            # configure the container registry
+            REGISTRY_REGION=$(echo "$REGISTRY_REGION" | awk -F ':' '{print $NF;}')
+            ibmcloud cr region-set $REGISTRY_REGION
+            ibmcloud cr login
+            export REGISTRY_URL=$(ibmcloud cr info | grep -m1 -i '^Container Registry' | awk '{print $3;}')
+            export DOCKER_CONTENT_TRUST_SERVER="https://$REGISTRY_URL:4443"
+            source "$ARCHIVE_DIR"/build.properties
+            echo "CHECKING $REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME:$IMAGE_TAG"
+            docker trust inspect "$REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME:$IMAGE_TAG"
+
+            #Required Parameters
+            # $VAULT_INSTANCE - name of vault
+            # $IBMCLOUD_TARGET_REGION - region hosting Key Protect Vault instance
+            # $IBMCLOUD_TARGET_RESOURCE_GROUP of the Key Protect Vault Instance
+            # $REGISTRY_NAMESPACE namespace of registry
+            # $IMAGE_NAME
+            # $IMAGE_TAG
+            # $DEVOPS_SIGNER - current signer
+            echo "Vault instance $VAULT_INSTANCE used to retrieve signing keys"
+            source <(curl -sSL "https://raw.githubusercontent.com/open-toolchain/commons/master/scripts/image_signing/signing_utils.sh")
+            # Restore signer pem key
+            VAULT_DATA=$(buildVaultAccessDetailsJSON "$VAULT_INSTANCE" "$IBMCLOUD_TARGET_REGION" "$IBMCLOUD_TARGET_RESOURCE_GROUP")
+            JSON_DATA="$(readData "$REGISTRY_NAMESPACE.keys" "$VAULT_DATA")"
+            signerkey=$(getJSONValue "$DEVOPS_SIGNER" "$JSON_DATA")
+            writeFile "$signerkey"
+            # Retrieve the signer passphrase
+            export DOCKER_CONTENT_TRUST_REPOSITORY_PASSPHRASE=$(getJSONValue "passphrase" "$signerkey")
+
+            # Pull the image
+            #TODO support multiple signatures. This requires knowing if there is already a signature present.
+            #Need to set DOCKER_CONTENT_TRUST=1 before the image pull if singture present
+            docker pull "$REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME:$IMAGE_TAG"
+            # Sign the image
+            export DOCKER_CONTENT_TRUST=1
+            docker trust sign "$REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME:$IMAGE_TAG"
+            docker trust inspect --pretty "$REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME"
+          }
+
+          retry $(params.retry-count) $(params.retry-delay) dct_sign
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+               echo "Error initializing Docker Cointainer Trust. It can be for several reasons.\
+              Please tun on PIPELINE_DEBUG (set to 1) and/or check the services availability https://ibmtoolbox.statuspage.io"
+              exit $exit_code
+           fi
+
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+        - name: retry-command
+          mountPath: /scripts
+
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

@@ -1,0 +1,74 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: icr-check-dockerfile
+spec:
+  params:
+    - name: path-to-dockerfile
+      default: /artifacts
+    - name: dockerfile
+      description: The name of the Dockerfile
+      default: "Dockerfile"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: app-directory
+      description: application path
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  steps:
+    - name: check-dockerfile
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      env:
+        - name: DOCKER_FILE
+          value: $(params.dockerfile)
+        - name: DOCKER_ROOT
+          value: $(params.path-to-dockerfile)
+        - name: HOME
+          value: "/root"
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e -o pipefail;
+          export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+          if [ $PIPELINE_DEBUG == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          export APP_DIRECTORY=$(params.app-directory)
+
+          # Input env variables
+          DOCKER_ROOT=${DOCKER_ROOT}/${APP_DIRECTORY}
+          echo "DOCKER_ROOT=${DOCKER_ROOT}"
+          echo "DOCKER_FILE=${DOCKER_FILE}"
+
+          # also run 'env' command to find all available env variables
+          # or learn more about the available environment variables at:
+          # https://cloud.ibm.com/docs/services/ContinuousDelivery/pipeline_deploy_var.html#deliverypipeline_environment
+
+          echo "=========================================================="
+          echo "Checking for Dockerfile at the repository root"
+          if [ -z "${DOCKER_ROOT}" ]; then DOCKER_ROOT=. ; fi
+          if [ -z "${DOCKER_FILE}" ]; then DOCKER_FILE=Dockerfile ; fi
+          if [ -f ${DOCKER_ROOT}/${DOCKER_FILE} ]; then
+              echo -e "Dockerfile found at: ${DOCKER_FILE}"
+          else
+              echo "Dockerfile not found at: ${DOCKER_FILE}"
+              exit 1
+          fi
+          echo "Linting Dockerfile"
+          npm install -g dockerlint
+          dockerlint -f ${DOCKER_ROOT}/${DOCKER_FILE}
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts

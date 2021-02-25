@@ -1,0 +1,49 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: gitsecure-discovery
+spec:
+  params:
+    - name: repository
+      description: the git repo
+    - name: revision
+      description: the revision
+      default: master
+    - name: commit-id
+      description: git commit id
+    - name: directory-name
+      description: directory name where the repository is cloned
+  results:
+    - name: status
+      description: status of gitsecure discovery task, possible value are-success|failure
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+  steps:
+    - name: discovery
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/gitsecure/discovery-task:2.2.0
+      imagePullPolicy: Always
+      workingDir: "/artifacts"
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          #!/bin/sh
+          REPO_DIR_PATH="/artifacts/$(params.directory-name)"
+
+          /usr/local/bin/discovery \
+            -giturl "$(params.repository)" \
+            -gitbranch "$(params.revision)" \
+            -repodir $REPO_DIR_PATH \
+            -rigapi "https://apiservice-dal.gitsecureapi.com" \
+            -commitid "$(params.commit-id)" \
+            -checks "app,image" \
+            -pipelineid "$PIPELINE_RUN_ID"
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts

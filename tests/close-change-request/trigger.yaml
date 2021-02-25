@@ -1,0 +1,40 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: template-close-change-request
+spec:
+  params:
+    - name: docker-config-json
+    - name: change-request-id
+    - name: pipeline-debug
+
+  resourcetemplates:
+    - apiVersion: v1
+      kind: Secret
+      data:
+        .dockerconfigjson: $(params.docker-config-json)
+      metadata:
+        name: cocoa-artifactory-auth
+      type: kubernetes.io/dockerconfigjson
+
+    - apiVersion: v1
+      kind: ServiceAccount
+      imagePullSecrets:
+        - name: cocoa-artifactory-auth
+      metadata:
+        name: cocoa-pullsecret
+
+    - apiVersion: tekton.dev/v1beta1
+      kind: PipelineRun
+      metadata:
+        name: pipelinerun-$(uid)
+      spec:
+        pipelineRef:
+          name: pipeline-close-change-request
+        serviceAccountName: cocoa-pullsecret
+        params:
+          - name: change-request-id
+            value: $(params.change-request-id)
+          - name: pipeline-debug
+            value: $(params.pipeline-debug)

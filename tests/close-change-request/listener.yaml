@@ -1,0 +1,11 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: listener-close-change-request
+spec:
+  triggers:
+    - binding:
+        name: binding-close-change-request
+      template:
+        name: template-close-change-request

@@ -1,0 +1,95 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: inventory-cr-add
+  labels:
+    app.kubernetes.io/version: "5.0.0"
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: change-request-id
+      descripton: unique servicenow change request id
+    - name: inventory-url
+      description: url of the git repo where the inventory is located
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+
+  steps:
+    - name: add-change-request
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.1.8@sha256:de2d767a5295334959955b39a681cb78e103addd09c3d6c311fa53ad724fcaea
+      workingDir: $(workspaces.artifacts.path)
+      env:
+        - name: CHANGE_REQUEST_ID
+          value: $(params.change-request-id)
+        - name: INVENTORY_URL
+          value: $(params.inventory-url)
+      script: |
+        #!/bin/bash
+        set -e -o pipefail;
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        export GHE_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+        export GHE_REPO=$(echo "$INVENTORY_URL" | cut -f5 -d/)
+        export GHE_ORG=$(echo "$INVENTORY_URL" | cut -f4 -d/)
+
+        update_inventory_branch() {
+          cocoa inventory label add \
+            --org="${GHE_ORG}" \
+            --repo="${GHE_REPO}" \
+            --to-label="${PIPELINE_RUN_ID}" \
+            "${CHANGE_REQUEST_ID}"
+        }
+
+        source /scripts/retry_command.sh
+
+        retry $(params.retry-count) $(params.retry-delay) update_inventory_branch
+
+        exit_code=$?
+
+        if [ $exit_code -ne 0 ]; then
+          echo "Error adding the inventory update to the inventory branch. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+          exit $exit_code
+        fi
+
+      volumeMounts:
+        - mountPath: /scripts
+          name: retry-command
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

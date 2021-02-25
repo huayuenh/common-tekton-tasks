@@ -1,0 +1,146 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: tekton-lint
+  documentation: https://github.ibm.com/one-pipeline/common-tekton-tasks/yaml/README.md
+  labels:
+    app.kubernetes.io/version: "1.0.1"
+spec:
+  params:
+    - name: definitions
+      default: "common-tekton-tasks/preview/**/*.yaml"
+    - name: path
+      description: path to YAML or directory containing YAMLS to scan
+      default: "/artifacts"
+    - name: statuses-url
+      description: set the github statues url to enable git status updates
+      default: ""
+    - name: status-context
+      description: customise github status context
+      default: "Tekton Linter"
+    - name: status-pending-description
+      description: customise github status pending description
+      default: "Running Tekton Linter..."
+    - name: status-success-description
+      description: customise github status success description
+      default: "Tekton Linter Passed"
+    - name: status-fail-description
+      description: customise github status failed description
+      default: "Tekton Lint Failed"
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: working-dir
+      description: Working directory to run the tekton-lint command
+      default: "/tekton-lint"
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  results:
+    - name: exit-code
+      description: The exit-code of the script
+    - name: status
+      description: The status based on exit-code
+
+  steps:
+    - name: tekton-lint
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      workingDir: "/artifacts"
+      env:
+        - name: STATUS_CONTEXT
+          value: $(params.status-context)
+        - name: STATUS_PENDING_DESCRIPTION
+          value: $(params.status-pending-description)
+        - name: STATUS_SUCCESS_DESCRIPTION
+          value: $(params.status-success-description)
+        - name: STATUS_FAILURE_DESCRIPTION
+          value: $(params.status-fail-description)
+        - name: PATH_TO_DEFS
+          value: $(params.path)
+        - name: PIPELINE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-id']
+        - name: PIPELINE_RUN_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+        - name: STATUSES_URL
+          value: $(params.statuses-url)
+      script: |
+        #!/bin/bash
+
+        set +ex
+        . /root/.nvm/nvm.sh
+
+        if [ $PIPELINE_DEBUG == 1 ]; then
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        function set-status() {
+          local statuses_url=$1
+          local target_url=$2
+          local state=$3
+          local context=$4
+          local description=$5
+          local body="{\"state\": \"$state\", \"target_url\": \"$target_url\", \
+          \"description\": \"$description\", \"context\": \"$context\"}"
+
+          curl -X POST $statuses_url \
+            -H "Authorization: Bearer $GHE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$body"
+        }
+
+        STATUSES_TARGET_URL="https://cloud.ibm.com/devops/pipelines/tekton/$PIPELINE_ID/runs/$PIPELINE_RUN_ID?env_id=ibm:yp:us-south"
+        if [[ ! -z $STATUSES_URL ]]; then
+          set-status $STATUSES_URL $STATUSES_TARGET_URL pending $STATUS_CONTEXT $STATUS_PENDING_DESCRIPTION
+        fi
+
+        GHE_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+        if [ ! -d /artifacts/tekton-lint ]; then
+          git clone https://github.com/IBM/tekton-lint.git
+          cd tekton-lint
+          npm i
+        fi
+
+        echo "Running lint on these definitions:"
+        echo "$(params.definitions)"
+
+        definitions=$(echo "$(params.definitions)" | sed "s#^#$PATH_TO_DEFS/#g" )
+
+        cd "$(params.working-dir)"
+        node /artifacts/tekton-lint/lint.js --format stylish $definitions
+        PASS=$?
+
+        echo $PASS | tee $(results.exit-code.path)
+
+        if [[ $PASS == 0 ]]; then
+          echo "No issues were found"
+          echo -n success | tee $(results.status.path)
+          if [[ ! -z $STATUSES_URL ]]; then
+            set-status $STATUSES_URL $STATUSES_TARGET_URL success $STATUS_CONTEXT $STATUS_SUCCESS_DESCRIPTION
+          fi
+        else
+          echo -n failure | tee $(results.status.path)
+          if [[ ! -z $STATUSES_URL ]]; then
+            set-status $STATUSES_URL $STATUSES_TARGET_URL failure $STATUS_CONTEXT $STATUS_FAILURE_DESCRIPTION
+          fi
+          exit 0
+        fi
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets

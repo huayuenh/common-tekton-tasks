@@ -1,0 +1,77 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: template-evidence-add
+spec:
+  params:
+    - name: evidence-repo-path
+    - name: namespace
+    - name: evidence-name
+    - name: evidence-type
+    - name: evidence-type-version
+    - name: result
+    - name: pipeline-debug
+    - name: ghe-token
+    - name: evidence-locker
+
+  resourcetemplates:
+
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: pipelinerun-$(uid)-pvc
+      spec:
+        resources:
+          requests:
+            storage: 5Gi
+        volumeMode: Filesystem
+        accessModes:
+          - ReadWriteOnce
+
+    - apiVersion: v1
+      kind: Secret
+      data:
+        .dockerconfigjson: $(params.docker-config-json)
+      metadata:
+        name: cocoa-artifactory-auth
+      type: kubernetes.io/dockerconfigjson
+
+    - apiVersion: v1
+      kind: ServiceAccount
+      imagePullSecrets:
+        - name: cocoa-artifactory-auth
+      metadata:
+        name: cocoa-pullsecret
+
+    - apiVersion: tekton.dev/v1alpha1
+      kind: PipelineRun
+      metadata:
+        name: pipelinerun-$(uid)
+      spec:
+        serviceAccountName: cocoa-pullsecret
+        pipelineRef:
+          name: pipeline-evidence-add
+        workspaces:
+          - name: evidence-locker
+            persistentVolumeClaim:
+              claimName: pipelinerun-$(uid)-pvc
+        params:
+          - name: evidence-repo-path
+            value: $(params.evidence-repo-path)
+          - name: namespace
+            value: $(params.namespace)
+          - name: evidence-name
+            value: $(params.evidence-name)
+          - name: evidence-type
+            value: $(params.evidence-type)
+          - name: evidence-type-version
+            value: $(params.evidence-type-version)
+          - name: result
+            value: $(params.result)
+          - name: pipeline-debug
+            value: $(params.pipeline-debug)
+          - name: ghe-token
+            value: $(params.ghe-token)
+          - name: evidence-locker
+            value: $(params.evidence-locker)

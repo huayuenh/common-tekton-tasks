@@ -1,0 +1,147 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: dct-verify
+spec:
+  params:
+    - name: app-name
+      description: The name of your app
+    - name: build-signer
+      description: build signer
+      default: devops-build
+    - name: validation-signer
+      description: validation signer
+    - name: registry-namespace
+      description: The registry namespace
+    - name: registry-region
+      description: the registry region
+    - name: image-tags
+      description: tags of the created image
+    - name: vault-name
+      description: the key protect instance name
+    - name: resource-group
+      description: the resource group
+    - name: cluster-name
+      description: the name of the targeted cluster
+    - name: region
+      description: target region
+    - name: working-dir
+      default: "/root"
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: ibmcloud-api-key-secret-key
+      description: the IBM Cloud API key from secrets
+      default: "ibmcloud-api-key"
+
+  steps:
+    - name: sign-image
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      env:
+        - name: HOME
+          value: $(params.working-dir)
+        - name: REGISTRY_NAMESPACE
+          value: $(params.registry-namespace)
+        - name: VAULT_INSTANCE
+          value: $(params.vault-name)
+        - name: IBMCLOUD_TARGET_RESOURCE_GROUP
+          value: $(params.resource-group)
+        - name: REGISTRY_REGION
+          value: $(params.registry-region)
+        - name: IBMCLOUD_TARGET_REGION
+          value: $(params.region)
+        - name: BUILD_CLUSTER
+          value: $(params.cluster-name)
+        - name: IMAGE_NAME
+          value: $(params.app-name)
+        - name: BUILD_CLUSTER_NAMESPACE
+          value: build
+        - name: BUILD_SIGNER
+          value: $(params.build-signer)
+        - name: VALIDATION_SIGNER
+          value: $(params.validation-signer)
+        - name: IMAGE_TAGS
+          value: $(params.image-tags)
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          #!/bin/bash
+          # uncomment to debug the script
+          # set -x
+
+          export IBM_CLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+
+          source /scripts/retry_command.sh
+
+          dct_verify() {
+
+            # This script inspect the docker image signatures to ensure compliance
+            IMAGE_TAG=$IMAGE_TAGS
+            source <(curl -sSL "https://raw.githubusercontent.com/open-toolchain/commons/master/\
+          scripts/image_signing/add_docker.sh")
+            source <(curl -s -S -L "https://raw.githubusercontent.com/open-toolchain/commons/master/\
+          scripts/setup_dind.sh")
+            # configure the container registry
+            REGISTRY_REGION=$(echo "$REGISTRY_REGION" | awk -F ':' '{print $NF;}')
+            ibmcloud cr region-set $REGISTRY_REGION
+            # login docker to ibm container registry
+            ibmcloud cr login
+            # configure DCT and inspect the image
+            REGISTRY_URL=$(ibmcloud cr info | grep -m1 -i '^Container Registry' | awk '{print $3;}')
+            export DOCKER_CONTENT_TRUST_SERVER=https://${REGISTRY_URL}:4443
+            docker trust inspect ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG} |
+              tee _image_inspect.json
+
+            # Check if the Builder signature is present
+            #if jq -e ".[] | select(.Name=\"$REGISTRY_URL/$REGISTRY_NAMESPACE/#$IMAGE_NAME:$IMAGE_TAG\") |
+            #.SignedTags[] | select(.#SignedTag=\"$IMAGE_TAG\") | select (.Signers[] |
+            # contains#(\"$BUILD_SIGNER\"))" _image_inspect.json; then
+            #  echo "Signature $BUILD_SIGNER found"
+            #else
+            #  echo "Signature $BUILD_SIGNER not found"
+            #  exit 1
+            #fi
+
+            # Check if the Validation signature is present
+            if jq -e ".[] | select(.Name=\"$REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME:$IMAGE_TAG\") |
+          .SignedTags[] | select(.SignedTag=\"$IMAGE_TAG\") | select (.Signers[] |
+          contains(\"$VALIDATION_SIGNER\"))" _image_inspect.json; then
+              echo "Signature $VALIDATION_SIGNER found"
+            else
+              echo "Signature $VALIDATION_SIGNER not found"
+              exit 1
+            fi
+          }
+          retry $(params.retry-count) $(params.retry-delay) dct_verify
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error initializing Docker Cointainer Trust. It can be for several reasons.\
+              Please tun on PIPELINE_DEBUG (set to 1) and/or check the services availability https://ibmtoolbox.statuspage.io"
+            exit $exit_code
+          fi
+
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+        - name: retry-command
+          mountPath: /scripts
+
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

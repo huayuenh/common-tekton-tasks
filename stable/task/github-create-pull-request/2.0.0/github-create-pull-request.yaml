@@ -1,0 +1,97 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: github-create-pull-request
+  labels:
+    app.kubernetes.io/version: "2.0.0"
+spec:
+  params:
+    - name: owner
+      description: "Required. The owner of the repository. (string)"
+    - name: repository
+      description: "Required. The name of the repository. (string)"
+    - name: head
+      description: "Required. The name of the branch where your changes are implemented. For cross-repository pull requests in the same network, namespace head with a user like this: username:branch. (string)"
+    - name: base
+      description: "Required. The name of the branch you want the changes pulled into. This should be an existing branch on the current repository. You cannot submit a pull request to one repository that requests a merge to a base of another repository. (string)"
+    - name: title
+      description: "Required. The title of the new pull request. (string)"
+    - name: body
+      description: "The contents of the pull request. (string)"
+      default: ""
+    - name: draft
+      description: "Indicates whether the pull request is a draft. (boolean, possible values: 0 - default / 1)"
+      default: "0"
+    - name: maintainer-can-modify
+      description: "Indicates whether maintainers can modify the pull request. (boolean, possible values: 0 / 1 - default)"
+      default: "1"
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+
+  results:
+    - name: pull-request-url
+      description: The URL of the created pull request.
+
+  stepTemplate:
+    env:
+      - name: PR_TITLE
+        value: $(params.title)
+      - name: PR_HEAD
+        value: $(params.head)
+      - name: PR_BASE
+        value: $(params.base)
+      - name: PR_BODY
+        value: $(params.body)
+      - name: PR_DRAFT
+        value: $(params.draft)
+      - name: PR_MAINTAINER_CAN_MODIFY
+        value: $(params.maintainer-can-modify)
+
+  steps:
+    - name: create-pull-request
+      image: python:3.8.6-alpine3.11@sha256:4b9149da5d775bdb86463135b2c044d96305623b60503d10e2da84ec5c40cfcf
+      script: |
+          #!/usr/bin/env python3
+          import json, os
+          from urllib import request
+
+          token_file = open("/secrets/$(params.git-api-token-key)", "r")
+          git_token = token_file.read()
+          git_token = "Bearer " + git_token
+          token_file.close()
+
+          url = "https://github.ibm.com/api/v3/repos/$(params.owner)/$(params.repository)/pulls"
+          headers = {
+            "Authorization": git_token,
+            "content-type": "application/json"
+          }
+          PR_BASE = os.getenv("PR_BASE") + "_candidate"
+
+          data_dict = {
+            "title": os.getenv("PR_TITLE"),
+            "head": os.getenv("PR_HEAD"),
+            "base": PR_BASE
+          }
+
+          if os.getenv("PR_MAINTAINER_CAN_MODIFY") == "0":
+            data_dict["maintainer_can_modify"] = False
+          if os.getenv("PR_DRAFT") == "1":
+            data_dict["draft"] = True
+          if os.getenv("PR_BODY") != "":
+            data_dict["body"] = os.getenv("PR_BODY")
+
+          data = json.dumps(data_dict).encode('utf8')
+          req = request.Request(url, data=data, headers=headers)
+          resp = request.urlopen(req)
+          resp_json = json.loads(resp.read().decode('utf8'))
+
+          print("Pull Request Posted to Github Enterprise! URL:" + resp_json["html_url"])
+
+          with open("$(results.pull-request-url.path)", "w") as out_file:
+            out_file.write(resp_json["html_url"])
+
+  workspaces:
+    - name: secrets
+      mountPath: /secrets

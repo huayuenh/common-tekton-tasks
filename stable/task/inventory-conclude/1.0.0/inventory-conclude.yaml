@@ -1,0 +1,91 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: inventory-conclude
+  labels:
+    app.kubernetes.io/version: "1.0.0"
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: inventory-repo-url
+      description: The url of the inventory git repository
+    - name: target-environment
+      description: Deployment target environment
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  workspaces:
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: INVENTORY_URL
+        value: $(params.inventory-repo-url)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+
+  steps:
+    - name: merge
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.1.8@sha256:de2d767a5295334959955b39a681cb78e103addd09c3d6c311fa53ad724fcaea
+      volumeMounts:
+        - mountPath: /scripts
+          name: retry-command
+
+      script: |
+        #!/bin/bash
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        export GHE_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+        INVENTORY_REPO=${INVENTORY_URL##*/}
+        export INVENTORY_REPO=${INVENTORY_REPO%.git}
+        INVENTORY_ORG=${INVENTORY_URL%/*}
+        export INVENTORY_ORG=${INVENTORY_ORG##*/}
+
+        conclude() {
+           cocoa inventory label move \
+            --org="${INVENTORY_ORG}" \
+            --repo="${INVENTORY_REPO}" \
+            --to-label="${PIPELINE_RUN_ID}" \
+            "$(params.target-environment)_latest"
+        }
+
+        source /scripts/retry_command.sh
+        retry $(params.retry-count) $(params.retry-delay) conclude
+
+        exit_code=$?
+
+        if [ $exit_code -ne 0 ]; then
+          echo "Error concluding deployment in inventory. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+          exit $exit_code
+        fi

@@ -1,0 +1,24 @@
+---
+apiVersion: tekton.dev/v1alpha1
+kind: Condition
+metadata:
+  name: util-is-equal
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: left
+      type: string
+    - name: right
+      type: string
+  check:
+    image: alpine
+    script: |
+      #!/bin/sh
+      if [ "$(params.left)" = "$(params.right)" ]; then
+        echo "$(params.left) == $(params.right)"
+        exit 0
+      else
+        echo "$(params.left) != $(params.right)"
+        exit 1
+      fi

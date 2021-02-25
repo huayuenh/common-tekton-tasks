@@ -1,0 +1,92 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: servicenow-change-state-to-implement
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: servicenow-api-url
+      description: The ServiceNow API URL you wish to use (test or live)
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: servicenow-api-token-secret-key
+      description: the servicenow api key from secrets
+      default: "servicenow-api-token"
+    - name: change-request-id
+      description: ID of the current Change Request
+    - name: retry-count
+      description: retry count
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+  results:
+    - name: exit-code
+      description: The exit-code of the script
+    - name: status
+      description: The status based on exit-code
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+  steps:
+    - name: change-state-to-implement
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:0.20
+      env:
+        - name: SERVICENOW_URL
+          value: $(params.servicenow-api-url)
+        - name: CHANGE_REQUEST_ID
+          value: $(params.change-request-id)
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e -o pipefail
+
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          export SERVICENOW_TOKEN=$(cat /secrets/$(params.servicenow-api-token-secret-key))
+
+          source /scripts/retry_command.sh
+
+          retry $(params.retry-count) $(params.retry-delay) \
+            cocoa change-request change-state-to-implement
+
+          exit_code=$?
+
+          echo $exit_code | tee $(results.exit-code.path)
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error changing change request state to implement."
+            exit $exit_code
+          else
+            echo -n success | tee $(results.status.path)
+          fi
+
+          echo "Change Request $CHANGE_REQUEST_ID state changed to 'implement'"
+
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+        - name: retry-command
+          mountPath: /scripts
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

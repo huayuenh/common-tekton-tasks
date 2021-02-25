@@ -1,0 +1,270 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: inventory-deployment-bom
+  labels:
+    tekton.dev/deprecated: true
+    app.kubernetes.io/version: "3.0.3"
+spec:
+  params:
+    - name: deployment-delta-list-path
+      description: Path to JSON list of application names in inventory
+    - name: inventory-integration
+      description: The toolchain integration name of the inventory repository
+      default: "inventory-repo"
+    - name: inventory-repo-url
+      description: The inventory repository
+      default: ""
+    - name: evidence-repo-url
+      description: URL to the evidence git repo
+    - name: cos-bucket-name
+      default: ""
+      description: Bucket name in your Cloud Object Storage instance, used as an Evidence Locker
+    - name: cos-endpoint
+      default: ""
+      description: Endpoint of your Cloud Object Storage instance, used as an Evidence Locker
+    - name: git-api-token-key
+      description: GitHub enterprise API token secret name
+      default: "git-token"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  results:
+    - name: status
+      description: The status based on exit-code
+    - name: deployment-bom-url
+      description: URL of the deployment BOM json in the locker
+    - name: deployment-bom-path
+      description: Path of the deployment BOM json on the workspace
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /runtime-secrets
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-id']
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+      - name: PIPELINE_RUN_URL
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+
+  steps:
+
+    - name: collect
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.2.2@sha256:f3b00fe152508501fc4712e72ba74668ef0f52d2a665045a95b0b2da95728441
+      workingDir: $(workspaces.artifacts.path)
+      volumeMounts:
+        - name: cd-config-volume
+          mountPath: /cd-config
+        - mountPath: /scripts
+          name: retry-command
+      env:
+        - name: INVENTORY_REPO
+          value: $(params.inventory-repo-url)
+      script: |
+        #!/bin/bash
+
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        if [[ $INVENTORY_REPO == "" ]]; then
+          INVENTORY_REPO=$(jq -r '.services[] | select(.toolchain_binding.name == "$(params.inventory-integration)")
+            | .parameters.owner_id + "/" + .parameters.repo_name' /cd-config/toolchain.json)
+        fi
+
+        source /scripts/retry_command.sh
+
+        GHE_REPO=${INVENTORY_REPO##*/}
+        export GHE_REPO=${GHE_REPO%.git}
+        GHE_ORG=${INVENTORY_REPO%/*}
+        export GHE_ORG=${GHE_ORG##*/}
+
+        export GHE_TOKEN=$(cat "/runtime-secrets/$(params.git-api-token-key)")
+
+        APPS="$(cat "$(params.deployment-delta-list-path)")"
+
+        for array_raw_item in $(echo "${APPS}" | jq -c '.[]'); do
+          export APP_NAME=$(echo "${array_raw_item}" | jq -r '.')
+
+          inv_get() {
+            data=$(cocoa inventory get \
+            --org="$GHE_ORG" \
+            --repo="$GHE_REPO" \
+            --entry="$APP_NAME" \
+            --label="${PIPELINE_RUN_ID}")
+
+            if [ -z "$data" ]; then
+              return 1
+            fi
+
+            echo $data
+          }
+
+          retry $(params.retry-count) $(params.retry-delay) inv_get
+
+          inventory_data=$(cocoa inventory get \
+            --org="$GHE_ORG" \
+            --repo="$GHE_REPO" \
+            --entry="$APP_NAME" \
+            --label="${PIPELINE_RUN_ID}")
+
+          mkdir -p "$(dirname "./${APP_NAME}_${PIPELINE_RUN_ID}.json")" \
+            && echo "$inventory_data" > "./${APP_NAME}_${PIPELINE_RUN_ID}.json"
+
+        done
+
+    - name: create
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      workingDir: $(workspaces.artifacts.path)
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        bom="$(jq '
+          .version="1.0.0" |
+          .type="BOM" |
+          .artifacts=[]
+        ' <<< "{}")"
+
+        APPS=$(cat "$(params.deployment-delta-list-path)")
+
+        if [ -z "$APP" ]; then
+          echo -n "$bom" > "./deployment-bom.json"
+        fi
+
+        bom="$(jq '.version="1.0.0" | .type="BOM" | .artifacts=[]' <<< "{}")"
+
+        for array_raw_item in $(echo "${APPS}" | jq -c '.[]'); do
+          APP_NAME=$(echo "${array_raw_item}" | jq -r '.')
+
+          inventory=$(cat "./${APP_NAME}_${PIPELINE_RUN_ID}.json")
+
+          name=$(echo "$inventory" | jq -r '.name')
+          version=$(echo "$inventory" | jq -r '.version')
+          commit=$(echo "$inventory" | jq -r '.commit_sha')
+          sha256=$(echo "$inventory" | jq -r '.artifact' | awk -F: '{print $2}')
+          signature=$(echo "$inventory" | jq -r '.app_artifacts .signature')
+          provenance=$(echo "$inventory" | jq -r '.app_artifacts .provenance')
+
+          entry="$(jq -c \
+            --arg name "$name" \
+            --arg version "${version}-${commit}" \
+            --arg type "container_image" \
+            --arg sha256 "$sha256" \
+            --arg provenance "$provenance" \
+            --arg signature "$signature" '
+            .name = $name |
+            .version = $version |
+            .type = $type |
+            .sha256 = $sha256 |
+            .signature = $signature |
+            .provenance = $provenance
+          ' <<< "{}")"
+
+          bom="$(echo "$bom" | jq --argjson entry "$entry" '.artifacts[ .artifacts | length ] |= $entry')"
+
+        done
+
+        echo -n "$bom" > "./deployment-bom.json"
+
+        echo "Deployment BOM created:"
+        echo ""
+
+        echo "$bom" | jq '.'
+
+        echo ""
+        echo "Saved as ./deployment-bom.json"
+
+    - name: upload
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.2.2@sha256:f3b00fe152508501fc4712e72ba74668ef0f52d2a665045a95b0b2da95728441
+      workingDir: $(workspaces.artifacts.path)
+      env:
+        - name: EVIDENCE_REPO_URL
+          value: "$(params.evidence-repo-url)"
+        - name: COS_BUCKET_NAME
+          value: "$(params.cos-bucket-name)"
+        - name: COS_ENDPOINT
+          value: "$(params.cos-endpoint)"
+      script: |
+        #!/bin/bash
+
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        EVIDENCE_REPO_NAME=${EVIDENCE_REPO_URL##*/}
+        export EVIDENCE_REPO_NAME=${EVIDENCE_REPO_NAME%.git}
+        EVIDENCE_REPO_ORG=${EVIDENCE_REPO_URL%/*}
+        export EVIDENCE_REPO_ORG=${EVIDENCE_REPO_ORG##*/}
+
+        export GHE_TOKEN=$(cat "/runtime-secrets/$(params.git-api-token-key)")
+
+        export BACKEND_PARAMETER="--backend=git"
+
+        if [[ \
+          "$COS_ENDPOINT" \
+          && "$COS_BUCKET_NAME" \
+        ]]; then
+          BACKEND_PARAMETER="--backend=cos,git"
+        fi
+
+        ARTIFACT_URL=$(cocoa artifact upload \
+          $BACKEND_PARAMETER \
+          --namespace="cd" \
+          "./deployment-bom.json")
+
+        echo -n "success" > $(results.status.path)
+        echo -n "$ARTIFACT_URL" > $(results.deployment-bom-url.path)
+        echo -n "deployment-bom.json" > $(results.deployment-bom-path.path)

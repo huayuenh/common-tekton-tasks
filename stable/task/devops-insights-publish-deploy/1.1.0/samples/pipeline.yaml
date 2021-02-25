@@ -1,0 +1,32 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: example-pipeline
+spec:
+  params:
+    - name: application
+    - name: doi-toolchain-id
+    - name: build-number
+    - name: pipeline-debug
+  tasks:
+    - name: doi-publish-deployrecord
+      taskRef:
+        name: doi-publish-deployrecord
+      params:
+        - name: app-name
+          value: "$(params.application)"
+        - name: toolchain-id
+          value: "$(params.doi-toolchain-id)"
+        - name: build-number
+          value: "$(params.build-number)"
+        - name: environment
+          value: "prod"
+        - name: job-url
+          value: "http://example.com"
+        - name: app-url
+          value: "http://example.com"
+        - name: toolchain-apikey-secret-key
+          value: "ibmcloud-api-key"
+        - name: pipeline-debug
+          value: "$(params.pipeline-debug)"

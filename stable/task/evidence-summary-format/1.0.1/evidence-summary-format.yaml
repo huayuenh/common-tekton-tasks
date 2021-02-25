@@ -1,0 +1,59 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: evidence-summary-format
+  labels:
+    tekton.dev/deprecated: true
+    app.kubernetes.io/version: "1.0.1"
+spec:
+  params:
+    - name: evidence-repo-path
+      description: path of the evidence repo
+      default: "."
+    - name: summary-path
+      description: path to the evidence summary
+    - name: pipeline-debug
+      description: pipeline debug mode
+      default: "0"
+  results:
+    - name: formatted-summary-path
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+  steps:
+    - name: evidence-format
+      image: ibmcom/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      workingDir: $(workspaces.evidence-locker.path)
+      script: |
+        #!/bin/bash
+
+        if [ $PIPELINE_DEBUG = 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        FORMATTED_SUMMARY_PATH="summary.txt"
+
+        # make sure we use an empty file
+        echo -n > $FORMATTED_SUMMARY_PATH
+
+        for evidence in $(cat "$(params.evidence-repo-path)/$(params.summary-path)" | jq -r '.evidences[] | @base64'); do
+          echo -n ${evidence} | base64 --decode | jq -r -j '.evidence_type_id' >> $FORMATTED_SUMMARY_PATH
+          echo -n ": " >> summary.txt
+          echo ${evidence} | base64 --decode | jq -r '.result' >> $FORMATTED_SUMMARY_PATH
+          echo -n "URL: " >> summary.txt
+          echo ${evidence} | base64 --decode | jq -r '.log[0].url' >> $FORMATTED_SUMMARY_PATH
+          echo "" >> $FORMATTED_SUMMARY_PATH
+        done
+
+        echo Formatted Summary:
+        echo ""
+        cat $FORMATTED_SUMMARY_PATH
+        echo -n "$FORMATTED_SUMMARY_PATH" > $(results.formatted-summary-path.path)
+
+  workspaces:
+    - name: evidence-locker

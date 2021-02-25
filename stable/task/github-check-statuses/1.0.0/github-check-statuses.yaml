@@ -1,0 +1,113 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: github-check-statuses
+  labels:
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  params:
+    - name: target-branch
+      description: Branch name for to check branch protection settings for
+    - name: required-checks
+      description: Required checks to verify on github, these should be set up for the specified target branch.
+    - name: gh-org
+      description: The Github Organization/User
+    - name: repository
+      description: The Github Repository to check
+    - name: git-commit
+      description: Commit hash of the Pull Request to check
+    - name: git-api-token-key
+      description: The name of the secret that contains the git token in the workspace
+      default: "git-token"
+    - name: retry-count
+      description: retry count to check status-checks on a commit
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+  results:
+    - name: exit-code
+      description: The exit-code of the script
+    - name: status
+      description: The status based on exit-code
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+      - name: PIPELINE_RUN_URL
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+  steps:
+    - name: check-github-statuses
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:0.21@sha256:018d0745890ac30cacdf9c836383f9a280ac8ab201f7506383ab2c85e2e7d232
+      env:
+        - name: GIT_BRANCH
+          value: $(params.target-branch)
+        - name: REQUIRED_CHECKS
+          value: $(params.required-checks)
+        - name: GIT_COMMIT
+          value: $(params.git-commit)
+        - name: GHE_REPO
+          value: $(params.repository)
+        - name: GHE_ORG
+          value: $(params.gh-org)
+
+      script: |
+        #!/bin/bash
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          env
+          cat /cd-config/toolchain.json
+          trap env EXIT
+          set -x
+        fi
+
+        GHE_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+        export GHE_TOKEN
+
+        source /scripts/retry_command.sh
+
+        retry $(params.retry-count) $(params.retry-delay) \
+          cocoa check pull-request-status
+
+        exit_code=$?
+
+        echo $exit_code | tee $(results.exit-code.path)
+
+        if [ $exit_code -eq 0 ]; then
+          echo -n success | tee $(results.status.path)
+        else
+          echo "Error checking github statuses. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+          echo -n failure | tee $(results.status.path)
+        fi
+
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+        - mountPath: /scripts
+          name: retry-command
+  workspaces:
+    - mountPath: /secrets
+      name: secrets
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

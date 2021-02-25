@@ -1,0 +1,11 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: listener-check-change-request-approval
+spec:
+  triggers:
+    - binding:
+        name: binding-check-change-request-approval
+      template:
+        name: template-check-change-request-approval

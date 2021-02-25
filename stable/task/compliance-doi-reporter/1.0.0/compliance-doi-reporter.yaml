@@ -1,0 +1,250 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: compliance-doi-reporter
+  labels:
+    app.kubernetes.io/version: "1.0.0"
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: app-name
+      description: Logical application name for DevOps Insights
+    - name: data
+      description: Task results from the pipeline in a JSON format
+    - name: environment
+      description: Optional, The environment name to associate with the test results. This option is ignored for unit tests, code coverage tests, and static security scans.
+      default: ""
+    - name: build-number
+      description: Devops Inisghts build number reference. Default to the CD Tekton Pipeline build number
+      default: ""
+    - name: toolchain-id
+      description: Toolchain service instance id - Default to the toolchain containing the CD Tekton PipelineRun currently executed
+      default: ""
+    - name: continuous-delivery-context-secret
+      description: name of the configmap containing the continuous delivery pipeline context secrets
+      default: "secure-properties"
+    - name: ibmcloud-api-key-secret-key
+      description: field in the secret that contains the api key used to access toolchain and DOI instance
+      default: "ibmcloud-api-key"
+    - name: ibmcloud-api
+      description: the ibmcloud api
+      default: https://cloud.ibm.com
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+
+  volumes:
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh
+    - name: compliance-helper-scripts
+      configMap:
+        name: compliance-helper-scripts
+        items:
+          - key: create_url.sh
+            path: create_url.sh
+          - key: create_doi_dataset_file.sh
+            path: create_doi_dataset_file.sh
+          - key: ibmcloud_doi_update_policy.sh
+            path: ibmcloud_doi_update_policy.sh
+          - key: create_doi_evidence_data.sh
+            path: create_doi_evidence_data.sh
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+
+  stepTemplate:
+    env:
+      - name: DATA
+        value: $(params.data)
+      - name: APP_NAME
+        value: $(params.app-name)
+      - name: BUILD_NUMBER
+        value: $(params.build-number)
+      - name: PIPELINE_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-id']
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+      - name: PIPELINE_RUN_URL
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+      - name: DEFAULT_BUILD_NUMBER
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/build-number']
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: TOOLCHAIN_ID
+        value: $(params.toolchain-id)
+
+  steps:
+    - name: publish-evidence-to-doi
+      image: ibmcom/pipeline-base-image@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      workingDir: $(workspaces.artifacts.path)
+      volumeMounts:
+        - mountPath: /scripts
+          name: retry-command
+        - mountPath: /compliance-helper-scripts
+          name: compliance-helper-scripts
+        - name: cd-config-volume
+          mountPath: /cd-config
+        - name: secrets
+          mountPath: /secrets
+      script: |
+        #!/bin/bash
+
+        set -e -o pipefail;
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        #
+        # check DOI integration
+        #
+
+        CURRENT_TOOLCHAIN_ID=$(jq -r '.toolchain_guid' /cd-config/toolchain.json)
+        DOI_IN_TOOLCHAIN=$(jq -e '[.services[] | select(.service_id=="draservicebroker")] | length' /cd-config/toolchain.json)
+
+        if [ "$DOI_IN_TOOLCHAIN" == 0 ]; then
+          if [ -z "$TOOLCHAIN_ID" ] || [ "$CURRENT_TOOLCHAIN_ID" == "$TOOLCHAIN_ID" ]; then
+            echo "No Devops Insights integration found in toolchain. Skipping ..."
+            exit 0
+          fi
+        fi
+
+        # Default Toolchain ID if needed
+        if [ -z "$TOOLCHAIN_ID" ]; then
+          TOOLCHAIN_ID=$CURRENT_TOOLCHAIN_ID
+        fi
+
+        #
+        # set up helpers
+        #
+
+        IBMCLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+
+        # Default build number if needed
+        if [ -z "$BUILD_NUMBER" ]; then
+          BUILD_NUMBER="$DEFAULT_BUILD_NUMBER"
+        fi
+
+        if [ "$(params.environment)" ]; then
+          ENVIRONMENT=" --env \"$(params.environment)\""
+        else
+          ENVIRONMENT=""
+        fi
+
+        source /scripts/retry_command.sh
+        source /compliance-helper-scripts/create_url.sh
+        source /compliance-helper-scripts/create_doi_dataset_file.sh
+        source /compliance-helper-scripts/ibmcloud_doi_update_policy.sh
+        source /compliance-helper-scripts/create_doi_evidence_data.sh
+
+        #
+        # Auth with IBM Cloud
+        #
+
+        retry $(params.retry-count) $(params.retry-delay) \
+          ibmcloud login --apikey "${IBMCLOUD_API_KEY}" -a "${IBM_CLOUD_API}" --no-region
+
+        exit_code=$?
+
+        if [ $exit_code -ne 0 ]; then
+          echo "Error logging in with IBMCLOUD_API_KEY"
+          exit $exit_code
+        fi
+
+        ibmcloud plugin update doi --force
+
+        echo ""
+
+        #
+        # iterate over data
+        #
+
+        for row in $(echo "${DATA}" | jq -c '.[] '); do
+
+          _jq() {
+            echo ${row} | jq -r ${1}
+          }
+
+          TASK_NAME=$(_jq '.name')
+          STEP_NAME=$(_jq '.step')
+          EVIDENCE_TYPE=$(_jq '.evidence_type')
+
+          echo "Processing $TASK_NAME/$STEP_NAME ..."
+          echo ""
+
+          #
+          # Create DOI dataset
+          #
+
+          DATASET_NAME="compliance-${TASK_NAME}"
+          DATASET_FILE=$(create_doi_dataset_file "$TASK_NAME" "$EVIDENCE_TYPE" "$DATASET_NAME")
+
+          retry $(params.retry-count) $(params.retry-delay) \
+            ibmcloud_doi_update_policy "$DATASET_FILE" "$TOOLCHAIN_ID"
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error during the doi policies update"
+            exit $exit_code
+          fi
+
+          #
+          # Create DOI evidence data
+          #
+
+          RESULT="failure"
+          if [ $(_jq '.expected') == $(_jq '.actual') ]; then
+          RESULT="success"
+          fi
+
+          EVIDENCE_DATA_FILE=$(create_doi_evidence_data "$TASK_NAME" "$RESULT")
+
+          #
+          # Publish data to DOI
+          #
+
+          URL=$(create_url "$PIPELINE_RUN_URL" "$TASK_NAME" "$STEP_NAME")
+
+          ibmcloud doi publishtestrecord \
+            --toolchainid="$TOOLCHAIN_ID" \
+            --logicalappname="$APP_NAME" \
+            --buildnumber=$BUILD_NUMBER \
+            --filelocation="${EVIDENCE_DATA_FILE}" \
+            --type="${DATASET_NAME}" \
+            --drilldownurl="${URL}" \
+            $ENVIRONMENT
+
+            echo ""
+        done

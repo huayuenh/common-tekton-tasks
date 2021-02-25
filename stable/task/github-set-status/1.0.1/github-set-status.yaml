@@ -1,0 +1,148 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: github-set-status
+  labels:
+    app.kubernetes.io/version: "1.0.1"
+spec:
+  params:
+    - name: secret-name
+      description: The name of the secret in the workspace
+    - name: repo-url
+      description: the URL of the Github repository
+    - name: commit-sha
+      description: The commit hash value on which the status will be set
+    - name: state
+      description: The commit state to set (pending, success, error, failure)
+    - name: task-name
+      description: The task name in the pipeline which status we indicate. Used to set up context and the exact URL to the taskRun
+      default: ""
+    - name: step-name
+      description: The exact step name in the pipeline task which status we indicate. Used to set up the exact URL to the taskRun
+      default: ""
+    - name: context
+      description: An optional context - this will be the 'name' of the state on the Github UI
+      default: continuous-integration
+    - name: prefix
+      description: An optional context - this will be the 'name' of the state on the Github UI
+      default: tekton
+    - name: target-url
+      description: A target URL which will be displayed on the Github UI
+      default: ""
+    - name: description
+      description: optional - A description which will be displayed on the Github UI
+      default: Tekton CI Status
+    - name: retry-count
+      description: retry count
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_URL
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+  steps:
+    - name: github-set-status
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.1.0@sha256:9ddd07bafd922f9b9ef7469a81d430710b7f1de17144d0ddbd6cf545da6a98f0
+      env:
+        - name: TASK_NAME
+          value: $(params.task-name)
+        - name: STEP_NAME
+          value: $(params.step-name)
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ $PIPELINE_DEBUG == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        get_github_state() {
+          declare -A GITHUB_STATE_MAPPER
+
+          GITHUB_STATE_MAPPER[failed]="failure"
+          GITHUB_STATE_MAPPER[canceled]="error"
+          GITHUB_STATE_MAPPER[running]="pending"
+
+          if [ ${GITHUB_STATE_MAPPER[$1]} ]; then
+            echo ${GITHUB_STATE_MAPPER[$1]}
+
+            return 0;
+          fi
+
+          echo "$1"
+        }
+
+        TARGET_URL=$(params.target-url)
+        if [ -z "$TARGET_URL" ]; then
+          TARGET_URL=$PIPELINE_RUN_URL
+
+          if [ -n "$TASK_NAME" ]; then
+            TARGET_URL=$(echo "$TARGET_URL" | sed -e "s/\(\/\)\{0,1\}\(?.*\)/\/$TASK_NAME\2/")
+
+            if [ -n "$STEP_NAME" ]; then
+              TARGET_URL=$(echo "$TARGET_URL" | sed -e "s/\(\/\)\{0,1\}\(?.*\)/\/$STEP_NAME\2/")
+            fi
+          fi
+        fi
+
+        export GHE_TOKEN=$(cat /secrets/$(params.secret-name))
+
+        IFS='/' read -ra URL_PARTS <<< "$(params.repo-url)"
+        REPO="${URL_PARTS[3]}/${URL_PARTS[4]}"
+
+        STATE="$(get_github_state "$(params.state)")"
+        export GHE_ORG=${URL_PARTS[3]}
+        export GHE_REPO=${URL_PARTS[4]}
+        export GIT_COMMIT=$(params.commit-sha)
+
+        echo "Setting '$STATE' state on commit '$(params.commit-sha)' in '$(params.repo-url)'"
+
+        CONTEXT="$(params.context)"
+        if [ -n "$(params.task-name)" ]; then
+          CONTEXT="$(params.prefix)/$(params.task-name)"
+        fi
+
+        source /scripts/retry_command.sh
+
+        retry $(params.retry-count) $(params.retry-delay) \
+          cocoa set-status \
+            --state="$STATE" \
+            --targetURL="$TARGET_URL" \
+            --context="$CONTEXT" \
+            --description="$(params.description)"
+
+        exit_code=$?
+
+        if [ $exit_code -ne 0 ]; then
+          echo "Error setting the github status. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+          exit $exit_code
+        fi
+
+      volumeMounts:
+        - mountPath: /scripts
+          name: retry-command
+
+  workspaces:
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

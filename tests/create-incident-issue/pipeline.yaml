@@ -1,0 +1,60 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline-create-incident-issue
+spec:
+
+  workspaces:
+    - name: artifacts
+    - name: secrets
+
+  params:
+    - name: ibmcloud-api-key
+    - name: repository
+    - name: incident-issues-url
+    - name: pipeline-debug
+    - name: result-status
+    - name: task-name
+    - name: commit-hash
+
+  tasks:
+    - name: get-git-credentials
+      taskRef:
+        name: git-get-credentials
+      workspaces:
+        - name: artifacts
+          workspace: artifacts
+      params:
+        - name: ibmcloud-api-key
+          value: $(params.ibmcloud-api-key)
+        - name: repository
+          value: $(params.repository)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+
+    - name: create-incident-issue
+      taskRef:
+        name: evidence-create-incident-issue
+      runAfter:
+        - get-git-credentials
+      workspaces:
+        - name: artifacts
+          workspace: artifacts
+        - name: secrets
+          workspace: secrets
+      params:
+        - name: repository
+          value: $(params.repository)
+        - name: secret-name
+          value: ghe-token
+        - name: incident-issue-repo
+          value: $(params.incident-issues-url)
+        - name: task-name
+          value: $(params.task-name)
+        - name: result-status
+          value: $(params.result-status)
+        - name: commit-hash
+          value: $(params.commit-hash)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)

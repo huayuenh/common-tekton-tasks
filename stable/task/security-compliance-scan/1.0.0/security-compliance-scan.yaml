@@ -1,0 +1,228 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: security-compliance-scan
+  labels:
+    tekton.dev/deprecated: true
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  params:
+    - name: integrations
+      description: new line separated json for security_compliance integrations
+      default: ""
+    - name: retry-count
+      description: retry count to check status-checks on a commit
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+  volumes:
+    - name: cd-config
+      configMap:
+        name: toolchain
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh
+  steps:
+    - name: publish-findings
+      image: ibmcom/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      volumeMounts:
+        - name: cd-config
+          mountPath: /cd-config
+        - name: retry-command
+          mountPath: /scripts
+      env:
+        - name: HOME
+          value: "/root"
+        - name: PIPELINE_DEBUG
+          value: $(params.pipeline-debug)
+        - name: CUSTOM_INTEGRATIONS
+          value: $(params.integrations)
+      # yamllint disable rule:line-length
+      script: |
+        #!/bin/bash
+
+        # Note the multiple tools are on different lines (compact json formatting in each line),
+        # that is, not in a json array, so while splitting on newline
+
+        function checkValue {
+          local param_name=$1
+          local value=$2
+          if [ -z "${value}" ] || [ "${value}" == "null" ];
+          then
+            echo "${param_name} not found"
+          fi
+        }
+
+        function isValid {
+          local value=$1
+          if [ "${value}" ] && [ "${value}" != "null" ];
+          then
+            echo "true"
+          fi
+        }
+
+        function getIntegrations {
+          local INDEX=1
+          local INTEGRATIONS=$1
+
+          echo "${INTEGRATIONS}" |\
+          while IFS=$'\n\r' read -r TOOL
+          do
+            echo "Processing Integration $INDEX"
+            INDEX=$((INDEX+1))
+
+            if [ "${TOOL}" ];
+            then
+              # TODO this redaction not good - treats { as secret ref, but not sure, might be present in actual secret
+              REDACTED=$(echo "${TOOL}" | jq -r '.parameters | ({"parameters": . })' | sed -E 's/(api-key.:[ ]?.)([^{][^"]+)\"/\1*****\"/' )
+              echo "TOOL.parameters: ${REDACTED}"
+
+              #process & post Security & Compliance data
+              postSecurityComplianceData "${TOOL}"
+            else
+              echo "Empty line found in processing data for integrations. skipping"
+            fi
+
+          done
+        }
+
+        function getToken {
+          local APIKEY=$1
+          local SC_IAM_ENDPOINT=$2
+          local sc_iam_token
+          sc_iam_token=$(curl \
+              -X POST \
+              "${SC_IAM_ENDPOINT}" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -H "Accept: application/json" \
+              --data-urlencode "grant_type=urn:ibm:params:oauth:grant-type:apikey" \
+              --data-urlencode "apikey=${APIKEY}" \
+              | jq -r '(.access_token)' )
+            echo "${sc_iam_token}"
+        }
+
+        function initiateScanRequest {
+          local token=$1
+          local account=$2
+          local body=$3
+          local trigger=$4
+          local response
+          response=$(curl \
+            -X POST \
+            -H "Authorization: ${token}" \
+            -H "Realm: ${account}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "${body}" \
+            "${trigger}")
+            echo "${response}"
+        }
+
+        function prepareAndInitiateScanRequest {
+          local apikey=$1
+          local iam_url=$2
+          local account=$3
+          local body=$4
+          local trigger=$5
+          local sc_iam_token
+          local bearer_token
+
+          sc_iam_token=$(getToken "${apikey}" "${iam_url}")
+          if [ -z "${sc_iam_token}" ] || [ "${sc_iam_token}" == "null" ];
+          then
+            echo "Failed to generate bearer token"
+            return 1
+          fi
+          bearer_token="Bearer ${sc_iam_token}"
+          result=$(initiateScanRequest "${bearer_token}" "${account}" "${body}" "${trigger}")
+          success=$(echo "$result" | jq '.result')
+          if [ "${success}" == "true" ]; then
+            echo "Successfully initiated Security & Compliance scan"
+            return 0
+          else
+            echo "Failed to initiate scan request"
+            return 1
+          fi
+        }
+
+        function postSecurityComplianceData {
+          local DATA=$1
+          local sc_api_key
+          local sc_iam_api
+          local sc_compliance_api
+          local sc_trigger_endpoint
+          local sc_trigger_url
+          local realm_account_id
+          local trigger_body_json
+          local sc_iam_url
+
+          sc_api_key=$(echo "${DATA}" | jq -r '.parameters["api-key"]' )
+          sc_iam_api=$(echo "${DATA}" | jq -r '.parameters.trigger_info.iam_api' )
+          sc_compliance_api=$(echo "${DATA}" | jq -r '.parameters.trigger_info.compliance_api' )
+          sc_trigger_endpoint=$(echo "${DATA}" | jq -r '.parameters.trigger_info.trigger_endpoint' )
+          sc_trigger_url="${sc_compliance_api}${sc_trigger_endpoint}"
+          realm_account_id=$(echo "${DATA}" | jq -r '.parameters.trigger_info.realm' )
+          trigger_body_json=$(echo "${DATA}" | jq -r '.parameters.trigger_info.body' )
+          # Per https://cloud.ibm.com/apidocs/iam-identity-token-api#gettoken-apikey
+          sc_iam_url="${sc_iam_api}/identity/token"
+
+          echo "checking all required parameters for security compliance scan request"
+
+          if [[ "$PIPELINE_DEBUG" == 1 ]]; then
+            echo "logging extracted data"
+            echo "sc_iam_api $sc_iam_api"
+            echo "sc_compliance_api $sc_compliance_api"
+            echo "sc_trigger_endpoint $sc_trigger_endpoint"
+            echo "sc_trigger_url $sc_trigger_url"
+            echo "Generating Security & Compliance bearer token"
+          fi
+
+          if [ "$(isValid "${sc_api_key}")" ] && [ "$(isValid "${sc_iam_api}")" ] && [ "$(isValid "${sc_compliance_api}")" ] && [ "$(isValid "${sc_trigger_endpoint}")" ] && [ "$(isValid "${sc_trigger_endpoint}")" ] && [ "$(isValid "${trigger_body_json}")" ];
+          then
+            source /scripts/retry_command.sh
+            retry "$(params.retry-count)" "$(params.retry-delay)" prepareAndInitiateScanRequest "${sc_api_key}" "${sc_iam_url}" "${realm_account_id}" "${trigger_body_json}" "${sc_trigger_url}"
+
+          else
+            echo "Missing params to create initiate Security & Compliance request"
+            checkValue "sc_api_key" "${sc_api_key}"
+            checkValue "sc_iam_api" "${sc_iam_api}"
+            checkValue "sc_compliance_api" "${sc_compliance_api}"
+            checkValue "sc_trigger_endpoint" "${sc_trigger_endpoint}"
+            checkValue "realm_account_id" "${realm_account_id}"
+            checkValue "trigger_body_json" "${trigger_body_json}"
+          fi
+
+        }
+
+        echo "Starting..."
+
+        if [ "${CUSTOM_INTEGRATIONS}" ];
+        then
+          echo "Using custom provided integration data"
+          COMPLIANCE_INTEGRATIONS="${CUSTOM_INTEGRATIONS}"
+        else
+          echo "using default data"
+          toolchain=$(cat /cd-config/toolchain.json)
+          if [ "${toolchain}" ];
+          then
+            COMPLIANCE_INTEGRATIONS=$(echo "${toolchain}" | jq --compact-output -r '.services[] | select (( .service_id=="security_compliance") and (.parameters.trigger_info))')
+          else
+            echo "Toolchain json not found"
+          fi
+        fi
+
+        if [ "$COMPLIANCE_INTEGRATIONS" ];
+        then
+          getIntegrations "$COMPLIANCE_INTEGRATIONS"
+        else
+          echo "No integrations found"
+        fi
+      # yamllint enable rule:line-length

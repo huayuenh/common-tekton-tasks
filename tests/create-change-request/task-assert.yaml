@@ -1,0 +1,29 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: assert-create-change-request
+spec:
+  params:
+    - name: change-request-id-result
+
+  steps:
+    - name: setup
+      image: ibmcom/pipeline-base-image:2.6
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e -o pipefail;
+
+          STATUS_FROM_RESULT_ID=$(curl  -s -o /dev/null -w '%{http_code}' --request GET \
+            --url "https://watsontest.service-now.com/api/ibmwc/change/$(params.change-request-id-result)/read" \
+            --header 'accept: application/json' \
+            --header 'authorization: Bearer qjM7ah76G3Xoy7HUcF1YqliYcMLTUE5y5NlJoSbOD1G2uVV8AiyC-GXQFNvWUD_BGREp7jlAzq7rIfUYQ_sGJg' \
+            --header 'content-type: application/json')
+
+          if [[ $STATUS_FROM_RESULT_ID != 200 ]]; then
+
+            echo "Change Request check for '$(params.change-request-id-result)' resulted in $STATUS_FROM_RESULT_ID"
+
+            exit 1
+          fi;

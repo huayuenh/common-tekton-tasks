@@ -1,0 +1,385 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: servicenow-prepare-change-request
+  labels:
+    app.kubernetes.io/version: "6.0.5"
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: deployment-delta-list-path
+      description: Path to JSON list of application names in inventory
+    - name: target-environment
+      description: Target branch/environment in the inventory repo.
+    - name: deployment-bom-path
+      description: The Deployment BOM JSON
+    - name: formatted-summary-path
+      description: Path to the formatted evidence summary
+      default: ""
+    - name: servicenow-configuration-item
+      description: The name of the service to be deployed as it is registered in ServiceNow
+    - name: omit-release-window
+      description: omit planned start and planned end data from the prepared json ("true"|"false")
+      default: "false"
+    - name: inventory-repo-url
+      description: The inventory repository
+      default: ""
+    - name: deployment-ready
+      description: If it's 'no', the 'deployment readiness' field in the CR will be marked as false
+      default: "yes"
+    - name: cluster
+      description: The name or ID of the target production cluster.
+      default: ""
+    - name: cluster-region
+      description: The target region of production cluster.
+      default: ""
+    - name: cluster-namespace
+      description:
+      default: ""
+    - name: emergency-label
+      description:
+      default: "EMERGENCY"
+    - name: change-request-id
+      description: optional ServiceNow Change Request ID
+      default: "notAvailable"
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: ibmcloud-api-key-secret-key
+      description: The IBM Cloud api key secret name
+      default: "ibmcloud-api-key"
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: break-glass-name
+      description: Name of the `ConfigMap` that holds Break-Glass mode settings
+      default: "environment-properties"
+    - name: break-glass-key
+      description: Key in the `break-glass-name` `ConfigMap` that holds the Break-Glass mode settings
+      default: "break_glass"
+    - name: break-glass-sn-region
+      description: Key in the `break-glass-name` `ConfigMap` that holds the Break-Glass mode ServiceNow region
+      default: "sn-region"
+
+    - name: ibmcloud-api
+      description: the ibmcloud api endpoint
+      default: "https://cloud.ibm.com"
+
+    - name: retry-count
+      description: retry count
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  results:
+    - name: change-request-json-path
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: dynamic-secrets
+      mountPath: /dynamic-secrets
+
+  volumes:
+    - name: steps-volume
+      emptyDir: {}
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh
+
+  stepTemplate:
+    env:
+      - name: HOME
+        value: "/root"
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: IBMCLOUD_API_ENDPOINT
+        value: $(params.ibmcloud-api)
+      - name: INVENTORY_TARGET
+        value: $(params.target-environment)
+      - name: DEPLOYMENT_DELTA_PATH
+        value: $(params.deployment-delta-list-path)
+      - name: INVENTORY_URL
+        value: $(params.inventory-repo-url)
+      - name: DEPLOYMENT_READY
+        value: $(params.deployment-ready)
+
+      - name: CLUSTER_REGION
+        value: $(params.cluster-region)
+      - name: CLUSTER_NAME
+        value: $(params.cluster)
+      - name: CLUSTER_NAMESPACE
+        value: $(params.cluster-namespace)
+
+      - name: SERVICENOW_CONFIGURATION_ITEM
+        value: $(params.servicenow-configuration-item)
+      - name: EMERGENCY_LABEL
+        value: $(params.emergency-label)
+      - name: CHANGE_REQUEST_ID
+        value: $(params.change-request-id)
+
+      - name: BREAK_GLASS
+        valueFrom:
+          configMapKeyRef:
+            name: $(params.break-glass-name)
+            key: $(params.break-glass-key)
+            optional: true
+      - name: BREAK_GLASS_SN_REGION
+        valueFrom:
+          configMapKeyRef:
+            name: $(params.break-glass-name)
+            key: $(params.break-glass-sn-region)
+            optional: true
+
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+
+  steps:
+    - name: set-variables
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      workingDir: $(workspaces.artifacts.path)
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        if [[ -n "$BREAK_GLASS" ]]; then
+          echo "Break-Glass mode is on, environment comes from $(params.break-glass-name), skipping the rest of the task..."
+          SERVICENOW_REGION_ID=$BREAK_GLASS_SN_REGION
+          echo "export SERVICENOW_REGION_ID=\"${SERVICENOW_REGION_ID}\"" >> /steps/step.variables
+          echo "export EMERGENCY_LABEL=\"${EMERGENCY_LABEL}\"" >> /steps/step.variables
+          echo "export SERVICENOW_CONFIGURATION_ITEM=${SERVICENOW_CONFIGURATION_ITEM}" >> /steps/step.variables
+          echo "export PLANNED_START=\"$(date --utc -d 'today + 3 min' '+%F %T')\"" >> /steps/step.variables
+          echo "export PLANNED_END=\"$(date --utc -d 'today + 30 min' '+%F %T')\"" >> /steps/step.variables
+          exit 0
+        fi
+
+        if [ -n "$CHANGE_REQUEST_ID" ] && [ "$CHANGE_REQUEST_ID" != "notAvailable" ]; then
+          exit 0
+        fi
+
+        source /scripts/retry_command.sh
+
+        export IBMCLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+
+        CLUSTER_REGION=$(echo "${CLUSTER_REGION}" | awk -F ":" '{print $NF}')
+
+        ibmcloud_login_and_cluster_config() {
+          ibmcloud config --check-version=false
+          ibmcloud login  -a "$IBMCLOUD_API_ENDPOINT" -r "$CLUSTER_REGION" --apikey "$IBMCLOUD_API_KEY"
+          ibmcloud ks cluster config --cluster "${CLUSTER_NAME}"
+        }
+
+        #
+        # Fetch target cluster region ID from its CRN
+        # need this data for ServiceNow CRs
+        #
+        echo "Connecting to IBM IKS cluster"
+
+        retry $(params.retry-count) $(params.retry-delay) ibmcloud_login_and_cluster_config
+
+        SERVICENOW_REGION_ID=$(ibmcloud ks cluster get -c $CLUSTER_NAME --json | jq -j .crn | awk -F: '{print $1":"$2":"$3":"$4"::"$6"::::"}')
+
+        #
+        # Save data for next step
+        #
+        echo "export IBMCLOUD_API_KEY=\"${IBMCLOUD_API_KEY}\""  >> /steps/step.variables
+        echo "export EMERGENCY_LABEL=\"${EMERGENCY_LABEL}\"" >> /steps/step.variables
+        echo "export SERVICENOW_CONFIGURATION_ITEM=${SERVICENOW_CONFIGURATION_ITEM}" >> /steps/step.variables
+
+        echo "export SERVICENOW_REGION_ID=\"${SERVICENOW_REGION_ID}\"" >> /steps/step.variables
+
+        echo "export PLANNED_START=\"$(date --utc -d 'today + 3 min' '+%F %T')\"" >> /steps/step.variables
+        echo "export PLANNED_END=\"$(date --utc -d 'today + 30 min' '+%F %T')\"" >> /steps/step.variables
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          cat /steps/step.variables
+        fi;
+
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+        - name: secrets
+          mountPath: /secrets
+        - mountPath: /scripts
+          name: retry-command
+
+    - name: prepare-cr
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.2.4@sha256:dc98cc52c0caede42149c08727147520e30e81fee543b8dd5939b45d06baa142
+      env:
+        - name: HOME
+          value: "/root"
+        - name: CHANGE_REQUEST_ID
+          value: $(params.change-request-id)
+      workingDir: $(workspaces.artifacts.path)
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+      script: |
+        #!/bin/bash
+
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        #
+        # skip this step if CR is already created
+        #
+        if [ -n "$CHANGE_REQUEST_ID" ] && [ "$CHANGE_REQUEST_ID" != "notAvailable" ]; then
+          echo "" > /artifacts/change-request.json
+          echo -n "change-request.json" > $(results.change-request-json-path.path)
+          exit 0
+        fi
+
+        #
+        # set up some variables
+        #
+        source /steps/step.variables
+
+        export NL=$'\n'
+
+        export GHE_TOKEN=$(cat "/dynamic-secrets/$(params.git-api-token-key)")
+
+        INVENTORY_REPO=${INVENTORY_URL##*/}
+        export INVENTORY_REPO=${INVENTORY_REPO%.git}
+        INVENTORY_ORG=${INVENTORY_URL%/*}
+        export INVENTORY_ORG=${INVENTORY_ORG##*/}
+
+        inventory_get() {
+          echo "$(cocoa inventory get \
+            --entry="$1" \
+            --property="$2" \
+            --label="$3" \
+            --org="$INVENTORY_ORG" \
+            --repo="$INVENTORY_REPO"
+          )"
+        }
+
+        #
+        # prepare git changelog for every deployed inventory entry
+        #
+        CHANGELOG=""
+
+        APPS=$(cat "$(params.deployment-delta-list-path)")
+
+        for array_raw_item in $(echo "${APPS}" | jq -c '.[]'); do
+
+          application_name=$(echo "${array_raw_item}" | jq -r '.')
+          artifact="$(inventory_get $application_name "artifact" "${PIPELINE_RUN_ID}")"
+          repo_url="$(inventory_get $application_name "repository_url" "${PIPELINE_RUN_ID}")"
+          commit_from="$(inventory_get $application_name "commit_sha" "$(params.target-environment)_latest")"
+          commit_to="$(inventory_get $application_name "commit_sha" "${PIPELINE_RUN_ID}")"
+
+          app_repo_org=$(echo "$repo_url" | cut -f4 -d/)
+          app_repo_name=$(echo "$repo_url" | cut -f5 -d/ | cut -f1 -d"\"")
+
+          CHANGELOG="${CHANGELOG} ${NL} Git changelog for ${application_name}: ${NL}"
+
+          if [ -z "$commit_from" ] && [ -n "$commit_to" ]; then
+            CHANGELOG="${CHANGELOG} ${NL}This is the first deployment of artifact: '$artifact' on environment '$SERVICENOW_REGION_ID'."
+          elif [ -n "$commit_from" ] && [ -n "$commit_to" ] && [ "$commit_from" == "$commit_to" ]; then
+            CHANGELOG="${CHANGELOG} ${NL}Artifact '$artifact' is already deployed on environment '$SERVICENOW_REGION_ID', there are no changes. Same artifact is going to be redeployed."
+          elif [ -n "$commit_from" ] && [ -n "$commit_to" ] && [ "$commit_from" != "$commit_to" ]; then
+            CHANGELOG="${CHANGELOG} ${NL}Git changelog of artifact '$artifact'${NL}"
+            CHANGELOG="${CHANGELOG} $(cocoa changelog \
+              --org="$app_repo_org" \
+              --repo="$app_repo_name" \
+              --from="$commit_from" \
+              --to="$commit_to")"
+          fi
+
+          CHANGELOG="${CHANGELOG}${NL}${NL}"
+        done
+
+        #
+        # set deployment window
+        #
+        PLANNED_START="--planned-start=\"$PLANNED_START\""
+        PLANNED_END="--planned-end=\"$PLANNED_END\""
+
+        if [ "$(params.omit-release-window)" == "true" ]; then
+          PLANNED_START=""
+          PLANNED_END=""
+        fi
+
+        #
+        # create cr json
+        #
+        cr_json="$(cocoa change-request prepare \
+          --org="$INVENTORY_ORG" \
+          --repo="$INVENTORY_REPO" \
+          --emergency-label="$(params.emergency-label)" \
+          --outage-duration="0 00:00:00" \
+          --environment="$SERVICENOW_REGION_ID" \
+          --system=\"${SERVICENOW_CONFIGURATION_ITEM}\" \
+          --deployment-ready="$DEPLOYMENT_READY" \
+          $PLANNED_START \
+          $PLANNED_END \
+          --branch="$(params.target-environment)")"
+
+        echo "$cr_json" > /steps/cr.json
+
+        DEPLOYMENT_BOM="$(cat ./$(params.deployment-bom-path))"
+        DEPLOYMENT_BOM="$(echo $DEPLOYMENT_BOM | jq '.')" # pretty-print json in CR
+
+        #
+        # attach summary
+        #
+        SUMMARY=""
+
+        if [ "$(params.formatted-summary-path)" ]; then
+          SUMMARY=$(cat "$(params.formatted-summary-path)")
+        fi
+
+        #
+        # attach inventory commit sha
+        #
+        SHA=$(cocoa inventory get-sha \
+          --org="$INVENTORY_ORG" \
+          --repo="$INVENTORY_REPO" \
+          --label="${PIPELINE_RUN_ID}")
+
+        printf "$CHANGELOG" | jq . -Rs > ./changelog
+        printf "$SUMMARY" | jq . -Rs > ./summary
+        printf "$DEPLOYMENT_BOM" | jq . -Rs > ./deployment_bom
+        printf "$SHA" | jq . -Rs > ./inventory_sha
+        printf "$INVENTORY_URL" | jq . -Rs > ./inventory_url
+
+        cr="$(jq \
+          --slurpfile changelog ./changelog \
+          --slurpfile summary ./summary \
+          --slurpfile deployment_bom ./deployment_bom \
+          --slurpfile inventory_sha ./inventory_sha \
+          --slurpfile inventory_url ./inventory_url \
+          '.description = "\(.description) \n\nINVENTORY COMMIT URL \n\n\($inventory_url[0])/commit/\($inventory_sha[0]) \n\n \($changelog[0]) \n\nEVIDENCE SUMMARY \n\n\($summary[0]) \n\nDEPLOYMENT BOM \n\n\($deployment_bom[0])"' \
+          /steps/cr.json \
+        )" && \
+        echo "${cr}" > /artifacts/change-request.json
+
+        cat /artifacts/change-request.json
+
+        echo -n "change-request.json" > $(results.change-request-json-path.path)

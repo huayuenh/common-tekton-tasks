@@ -1,0 +1,91 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: terraform-lint
+spec:
+  params:
+    - name: repository
+      type: string
+      description: Input Github repository where terraform is found
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: git-api-token-key
+      description: The name of the secret in the workspace
+      default: "git-token"
+    - name: tf-dir
+      description: The directory to find the main terraform file
+      default: "."
+
+  results:
+    - name: status
+      description: status of gitsecure terraform compliance task, possible value are-success|failure
+    - name: evidence-store
+      description: filepath to store terraform compliance task evidence
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(inputs.params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+  steps:
+    - name: terraform-lint
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/gitsecure/terraform-compliance:0.1
+      imagePullPolicy: Always
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          if [[ $PIPELINE_DEBUG == 1 ]];
+            then
+              pwd
+              env
+              trap env EXIT
+              set -x
+              LOG_LEVEL="debug"
+            else
+              LOG_LEVEL="info"
+          fi
+          echo "Running terraform compliance task"
+          GIT_TOKEN=$(cat "/artifacts/$(params.git-api-token-key)")
+          REPOSITORY=$(params.repository)
+          DIRECTORY_NAME=$(basename "${REPOSITORY##*/}" .git)
+          CLONE_PATH="/artifacts/$DIRECTORY_NAME/"
+
+          if [[ $PIPELINE_DEBUG == 1 ]];
+            then
+              ls $CLONE_PATH
+          fi
+
+          result="success"
+          cd $CLONE_PATH/$(params.tf-dir)
+          ls *.tf
+          if [ $? -ne 0 ]; then export result="failure"; fi
+
+          terraform init
+          if [ $? -ne 0 ];
+            then
+              export result="failure"
+            else
+              terraform validate
+              if [ $? -ne 0 ]; then export result="failure"; fi
+          fi
+
+          echo -n $result > "$(results.status.path)"
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /dynamic-secrets
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)

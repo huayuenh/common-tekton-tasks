@@ -1,0 +1,121 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: iks-create-namespace
+spec:
+  params:
+    - name: cluster-name
+      description: The IBM Cloud cluster name
+    - name: cluster-region
+      description: The IBM Cloud region for your cluster
+    - name: cluster-namespace
+      description: The IBM Cloud cluster namespace
+      default: "default"
+    - name: ibmcloud-api
+      description: the ibmcloud api endpoint
+      default: "https://cloud.ibm.com"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: ibmcloud-api-key-secret-key
+      description: the IBM Cloud API key from secrets
+      default: "ibmcloud-api-key"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "20"
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  steps:
+    - name: create-namespace
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      env:
+        - name: API
+          value: $(params.ibmcloud-api)
+        - name: REGION
+          value: $(params.cluster-region)
+        - name: CLUSTER_NAMESPACE
+          value: $(params.cluster-namespace)
+        - name: PIPELINE_KUBERNETES_CLUSTER_NAME
+          value: $(params.cluster-name)
+
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          #!/bin/bash
+          set -e -o pipefail
+
+          if [ $PIPELINE_DEBUG == 1 ]; then
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          IBMCLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+          export IBMCLOUD_API_KEY
+
+          source /scripts/retry_command.sh
+          # if registry region is in the 'ibm:yp:<region>' just keep the region part
+          export REGION=$(echo "${REGION}" | awk -F ":" '{print $NF}')
+          ibmcloud_login() {
+            ibmcloud login -a $API -r $REGION
+            $(ibmcloud ks cluster config --cluster "${PIPELINE_KUBERNETES_CLUSTER_NAME}" --export)
+          }
+
+          retry $(params.retry-count) $(params.retry-delay) ibmcloud_login
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error logging in with IBMCLOUD_API_KEY"
+            exit $exit_code
+          fi
+
+          create_namespace() {
+            echo "Configuring cluster namespace"
+            if kubectl get namespace ${CLUSTER_NAMESPACE}; then
+              echo -e "Namespace ${CLUSTER_NAMESPACE} found."
+            else
+              kubectl create namespace ${CLUSTER_NAMESPACE}
+              echo -e "Namespace ${CLUSTER_NAMESPACE} created."
+            fi
+          }
+
+          retry $(params.retry-count) $(params.retry-delay) create_namespace
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error creating namespace $CLUSTER_NAMESPACE"
+            exit $exit_code
+          fi
+
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+        - name: retry-command
+          mountPath: /scripts
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

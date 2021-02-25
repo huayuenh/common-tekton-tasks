@@ -1,0 +1,7 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: binding-%TASK_NAME%
+spec:
+  params:

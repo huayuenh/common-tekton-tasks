@@ -1,0 +1,84 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: inventory-get
+  labels:
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  params:
+    - name: name
+      description: The name of the inventory entry.
+    - name: target
+      description: Target branch in the inventory repo.
+    - name: property
+      description: The property to get from the target in the inventory.
+    - name: inventory-url
+      description: The path to the inventory repository on the workspace.
+    - name: git-api-token-key
+      description: Github Enterprise API token secret name.
+      default: "git-token"
+    - name: pipeline-debug
+      description: Enables pipeline debug mode.
+      default: "0"
+    - name: default-value
+      description: The default data used as a fallback value if allow-default-value is set to true
+      default: ""
+    - name: allow-default-value
+      description: Allow using a default fallback value if it fails to get data from inventory
+      default: "false"
+
+  results:
+    - name: value
+      description: The value of the given property
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: INVENTORY_URL
+        value: $(params.inventory-url)
+      - name: DEFAULT_VALUE
+        value: $(params.default-value)
+      - name: ALLOW_DEFAULT
+        value: $(params.allow-default-value)
+  steps:
+    - name: get-property-from-inventory
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.1.2@sha256:daee352e1bafc11303f00c0669281493c6d266dc76ea505070a5d6951a0f5cc9
+      script: |
+          #!/bin/bash
+          set -o pipefail;
+
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          export GHE_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+          GHE_REPO=$(echo "$INVENTORY_URL" | cut -f5 -d/)
+          GHE_ORG=$(echo "$INVENTORY_URL" | cut -f4 -d/)
+
+          PARAMS="--entry=\"$(params.name)\" \
+          --environment=\"$(params.target)\" \
+          --property=\"$(params.property)\" \
+          --org=\"$GHE_ORG\" \
+          --repo=\"$GHE_REPO\""
+
+          echo "Getting '$(params.property)' property for application '$(params.name)' from target '$(params.target)'..."
+          VALUE=$(cocoa inventory get $PARAMS)
+
+          EXIT_CODE=$?
+
+          if [[ -z "$VALUE" && "$ALLOW_DEFAULT" != "false" ]]; then
+            echo -n "$DEFAULT_VALUE" | tee "$(results.value.path)"
+            exit 0
+          fi;
+
+          echo -n "$VALUE" | xargs | tee "$(results.value.path)"
+          exit $EXIT_CODE
+
+  workspaces:
+    - name: secrets
+      mountPath: /secrets

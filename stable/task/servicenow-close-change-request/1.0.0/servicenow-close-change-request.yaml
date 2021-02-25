@@ -1,0 +1,213 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: servicenow-close-change-request
+  labels:
+    app.kubernetes.io/version: "1.0.0"
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: close-category
+      description: Reason of closing the CR, possible values are "successful", "successful_issues", "unsuccessful" or "cancelled"
+      default: "successful"
+    - name: close-notes
+      description: Text containing any kind of closing notes.
+      default: ""
+    - name: servicenow-api-url
+      description: The ServiceNow API URL you wish to use (test or live)
+    - name: continuous-delivery-context-secret
+      descriptiom: Reference name for the secret resource
+      default: "secure-properties"
+    - name: servicenow-api-token-secret-key
+      description: ServiceNow api token name
+      default: "servicenow-api-token"
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: change-request-id
+      description: the id of the generated or manually provided cr
+    - name: retry-count
+      description: retry count
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: close-notes-script
+      description:
+      default: ""
+    - name: close-category-script
+      description:
+      default: ""
+    - name: close-data-base-image
+      description: the base image to use for running the step to create close data
+      default: "ibmcom/pipeline-base-image@sha256:282677e79ccb9d20c699d384a54093894de03675752cd848a3133266c898c14c"
+
+  results:
+    - name: exit-code
+      description: The exit-code of the script
+    - name: status
+      description: The status based on exit-code
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+  steps:
+    - name: create-close-information
+      image: $(params.close-data-base-image)
+      workingDir: "/artifacts"
+      env:
+        - name: CLOSE_NOTES
+          value: $(params.close-notes)
+        - name: CLOSE_CATEGORY
+          value: $(params.close-category)
+        - name: PIPELINE_RUN_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['tekton.dev/pipelineRun']
+        - name: BUILD_NUMBER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/build-number']
+        - name: PIPELINE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-id']
+        - name: TRIGGER_TYPE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/trigger-type']
+        - name: TRIGGER_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/trigger-name']
+        - name: TRIGGERED_BY
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/triggered-by']
+      script: |
+        #!/bin/bash
+
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        printf "%s " '$(params.close-notes-script)' >> /steps/close-notes-script
+
+        if [[ $(wc -c /steps/close-notes-script | awk '{print $1}') -gt 1 ]]; then
+
+          if IFS= LC_ALL=C read -rN2 shebang < /steps/close-notes-script && [ "$shebang" = '#!' ]; then
+            echo "The user provided a bang-line for close-notes-script!"
+          else
+            echo "Using default Shell interpreter for close-notes-script!"
+            echo "#!/bin/sh" | cat - /steps/close-notes-script > temp-script && mv temp-script /steps/close-notes-script
+          fi
+          chmod +x /steps/close-notes-script
+          /steps/close-notes-script >/steps/close-notes.content
+        else
+          echo -n "$(params.close-notes)" > /steps/close-notes.content
+        fi
+
+        printf "%s " '$(params.close-category-script)' >> /steps/close-category-script
+
+        if [[ $(wc -c /steps/close-category-script | awk '{print $1}') -gt 1 ]]; then
+          if IFS= LC_ALL=C read -rN2 shebang < /steps/close-category-script && [ "$shebang" = '#!' ]; then
+            echo "The user provided a bang-line for close-category-script!"
+          else
+            echo "Using default Shell interpreter for close-category-script!"
+            echo "#!/bin/sh" | cat - /steps/close-category-script > temp-script && mv temp-script /steps/close-category-script
+          fi
+          chmod +x /steps/close-category-script
+          /steps/close-category-script >/steps/close-category.content
+        else
+          echo -n "$(params.close-category)" > /steps/close-category.content
+        fi
+
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+
+    - name: close-change-request
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:0.20@sha256:d959723c25779ba02ef710090433e237696348b15586b0a5bd37a0f1d78287f1
+      env:
+        - name: SERVICENOW_URL
+          value: $(params.servicenow-api-url)
+        - name: CHANGE_REQUEST_ID
+          value: $(params.change-request-id)
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e -o pipefail
+
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          export SERVICENOW_TOKEN=$(cat "/secrets/$(params.servicenow-api-token-secret-key)")
+          export GHE_TOKEN=$(cat "/dynamic-secrets/$(params.git-api-token-key)")
+
+          source /scripts/retry_command.sh
+
+          # load the category and notes from steps (can be generated by script too)
+          CLOSE_CATEGORY="$(cat /steps/close-category.content)"
+          CLOSE_NOTES="$(cat /steps/close-notes.content)"
+
+          retry $(params.retry-count) $(params.retry-delay) \
+            cocoa change-request close \
+            --close-category="${CLOSE_CATEGORY}" \
+            --close-notes="${CLOSE_NOTES}"
+
+          exit_code=$?
+
+          echo $exit_code | tee $(results.exit-code.path)
+
+          if [ $exit_code -eq 0 ]; then
+            echo -n success | tee $(results.status.path)
+            echo "Change Request $CHANGE_REQUEST_ID closed"
+          else
+            echo "Error closing change request."
+            exit $exit_code
+          fi
+
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+        - name: secrets
+          mountPath: /secrets
+        - name: retry-command
+          mountPath: /scripts
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: dynamic-secrets
+      mountPath: /dynamic-secrets
+
+  volumes:
+    - name: steps-volume
+      emptyDir: {}
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

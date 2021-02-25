@@ -1,0 +1,39 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline-util-run
+spec:
+  params:
+    - name: repository
+    - name: ibmcloud-api-key
+    - name: pipeline-debug
+
+  workspaces:
+    - name: artifacts
+
+  tasks:
+    - name: util-run
+      taskRef:
+        name: util-run
+      workspaces:
+        - name: scripts
+          workspace: artifacts
+      params:
+        - name: script
+          value: |
+            #!/bin/sh
+            exit 0
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+
+    - name: assert
+      taskRef:
+        name: assert-util-run
+      runAfter:
+        - util-run
+      params:
+        - name: exit-code
+          value: $(tasks.util-run.results.exit-code)
+        - name: status
+          value: $(tasks.util-run.results.status)

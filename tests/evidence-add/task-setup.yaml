@@ -1,0 +1,28 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: setup-evidence-add
+spec:
+  params:
+    - name: ghe-token
+    - name: evidence-locker
+
+  workspaces:
+    - name: evidence-locker
+      mountPath: /evidence-locker
+
+  steps:
+    - name: setup
+      image: ibmcom/pipeline-base-image:2.6
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e -o pipefail;
+
+          cd "$(workspaces.evidence-locker.path)"
+
+          git config --global user.email "tekton@example.com"
+          git config --global user.name "Tekton"
+
+          git clone "https://$(params.ghe-token)@github.ibm.com/$(params.evidence-locker).git" .

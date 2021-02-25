@@ -1,0 +1,172 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: evidence-upload-summary
+  labels:
+    app.kubernetes.io/version: "2.0.0"
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: cos-bucket-name
+      default: ""
+      description: Bucket name in your Cloud Object Storage instance, used as an Evidence Locker
+    - name: cos-endpoint
+      default: ""
+      description: Endpoint of your Cloud Object Storage instance, used as an Evidence Locker
+    - name: toolchain-apikey-secret-key
+      default: "ibmcloud-api-key"
+    - name: continuous-delivery-context-secret
+      default: "secure-properties"
+    - name: evidence-repo-path
+      description: path of the evidence repo
+      default: "."
+    - name: evidence-summary-path
+      description: path of the evidence summary to upload
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: pipeline-debug
+      description: pipeline debug mode
+      default: "0"
+
+  workspaces:
+    - name: evidence-locker
+
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+
+  steps:
+    - name: push-summary-to-git-locker
+      image: ibmcom/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      workingDir: $(workspaces.evidence-locker.path)/$(params.evidence-repo-path)/
+      script: |
+          #!/bin/bash
+
+          set -e -o pipefail
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          git config --global user.email "tekton@example.com"
+          git config --global user.name "Tekton"
+
+          git add "$(params.evidence-summary-path)"
+          git commit -q -m "upload evidence summary for $PIPELINE_RUN_ID"
+
+          retries="$(params.retry-count)"
+
+          i=1
+          while [ $i -le $retries ]
+          do
+              if git push -q; then
+                  break
+              else
+                git pull -q
+                sleep 1
+              fi
+              i=$(( $i + 1 ))
+
+              if [ $i -gt $retries ]; then
+                echo "Could not add $(params.evidence-summary-path) to the evidence-locker repository!"
+                exit 1
+              else
+                echo "Retrying to push summary (try $i)..."
+              fi
+          done
+
+          echo "The following summary was pushed to the evidence locker repository:"
+          jq . "$(params.evidence-summary-path)"
+
+    - name: upload-summary-to-cos-locker
+      image: ibmcom/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      volumeMounts:
+        - mountPath: /secrets
+          name: secrets
+      env:
+        - name: COS_BUCKET_NAME
+          value: $(params.cos-bucket-name)
+        - name: COS_ENDPOINT
+          value: $(params.cos-endpoint)
+      script: |
+          #!/bin/bash
+
+          set -e -o pipefail
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          if ! [[ \
+            "$COS_ENDPOINT" \
+            && "$COS_BUCKET_NAME" \
+          ]]; then
+            echo "No COS Integration configured, skipping..."
+            exit 0
+          fi
+
+          IBMCLOUD_API_TOKEN=$(cat "/secrets/$(params.toolchain-apikey-secret-key)")
+          IAM_RESPONSE=$(
+            curl -k -X POST \
+            --header "Content-Type: application/x-www-form-urlencoded" \
+            --header "Accept: application/json" \
+            --data-urlencode "grant_type=urn:ibm:params:oauth:grant-type:apikey" \
+            --data-urlencode "apikey=$IBMCLOUD_API_TOKEN" \
+            https://iam.cloud.ibm.com/identity/token
+          )
+          COS_TOKEN=$(echo $IAM_RESPONSE | jq -r '.access_token')
+
+          cd "$(workspaces.evidence-locker.path)"/"$(params.evidence-repo-path)"/
+
+          SUMMARY_CONTENT=$(cat "$(params.evidence-summary-path)")
+          CONTENT_HASH=$(echo "$SUMMARY_CONTENT" | md5sum | awk '{print $1}')
+          OBJECT_PATH="$(params.evidence-summary-path)"
+          OBJECT_PATH=${OBJECT_PATH:4}
+          OBJECT_KEY="$OBJECT_PATH"_"$CONTENT_HASH"
+
+          retries="$(params.retry-count)"
+          i=1
+          while [ $i -le $retries ]
+          do
+              RESPONSE=$(
+              curl -X "PUT" "https://$COS_ENDPOINT/$COS_BUCKET_NAME/$OBJECT_KEY" \
+                   -H "Authorization: bearer $COS_TOKEN" \
+                   -H "Content-Type: text/html; charset=UTF-8" \
+                   -d "$SUMMARY_CONTENT"
+              )
+
+              if ! [[ "$RESPONSE" ]]; then
+                  break
+              else
+                echo "CURL Response:"
+                echo "$RESPONSE"
+                sleep 1
+              fi
+              i=$(( $i + 1 ))
+
+              if [ $i -gt $retries ]; then
+                echo "Could not upload $(params.evidence-summary-path) to the COS evidence-locker!"
+                exit 1
+              else
+                echo "Retrying to upload summary to COS Bucket (try $i)..."
+              fi
+          done
+
+          echo "The following summary was uploaded to the evidence locker repository:"
+          jq . "$(params.evidence-summary-path)"

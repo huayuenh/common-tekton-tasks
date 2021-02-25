@@ -1,0 +1,42 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: gitsecure-ossc-check
+spec:
+  params:
+    - name: repository
+      description: the git repo
+    - name: revision
+      description: the revision
+      default: master
+    - name: commit-id
+      description: git commit id
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: ibmcloud-api-key-secret-key
+      description: the IBM Cloud API key from secrets
+      default: "ibmcloud-api-key"
+  steps:
+    - name: ossc
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/gitsecure/ossc-task:1.0.0
+      imagePullPolicy: Always
+      script: |
+        #!/bin/bash
+
+        IBM_CLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+
+        python /ossc/ossc.py --giturl "$(params.repository)" \
+                              --gitbranch "$(params.revision)" \
+                              --rigserviceapi http://169.47.180.157:30850 \
+                              --apikey "$IBM_CLOUD_API_KEY" \
+                              --commitid "$(params.commit-id)"
+
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)

@@ -1,0 +1,103 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: inventory-cr-add
+  labels:
+    app.kubernetes.io/version: "4.0.0"
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: change-request-id
+      descripton: unique servicenow change request id
+    - name: deployment-delta-list-path
+      description: Path to JSON list of application names in inventory
+    - name: inventory-url
+      description: url of the git repo where the inventory is located
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: target-environment
+      description: deployment target environment
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+
+  steps:
+    - name: add-change-request
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.1.7@sha256:0d672453433c67d9146d2e9bc52575797c81eaff0654b4da4bf2a46dd8701a0b
+      workingDir: $(workspaces.artifacts.path)
+      env:
+        - name: CHANGE_REQUEST_ID
+          value: $(params.change-request-id)
+        - name: INVENTORY_URL
+          value: $(params.inventory-url)
+      script: |
+        #!/bin/bash
+        set -e -o pipefail;
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        export GHE_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+        export GHE_REPO=$(echo "$INVENTORY_URL" | cut -f5 -d/)
+        export GHE_ORG=$(echo "$INVENTORY_URL" | cut -f4 -d/)
+
+        update_inventory_branch() {
+          APPLICATION=$1
+          cocoa inventory promote --name="$APPLICATION" --source="$(params.target-environment)"_candidate --target="$(params.target-environment)" --branch="$CHANGE_REQUEST_ID"
+        }
+
+        source /scripts/retry_command.sh
+
+        APPS="$(cat "$(params.deployment-delta-list-path)")"
+
+        cd $INVENTORY_FOLDER
+
+        for array_raw_item in $(echo "${APPS}" | jq -c '.[]'); do
+          APP_NAME=$(echo "${array_raw_item}" | jq -r '.')
+          retry $(params.retry-count) $(params.retry-delay) update_inventory_branch $APP_NAME
+        done
+
+        exit_code=$?
+
+        if [ $exit_code -ne 0 ]; then
+          echo "Error adding the inventory update to the inventory branch. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+          exit $exit_code
+        fi
+
+      volumeMounts:
+        - mountPath: /scripts
+          name: retry-command
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

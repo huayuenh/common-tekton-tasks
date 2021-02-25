@@ -1,0 +1,113 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline-containerize
+spec:
+  params:
+    - name: pipeline-debug
+    - name: ibmcloud-api-key
+    - name: repository
+    - name: branch
+    - name: revision
+    - name: inventory-repo
+    - name: version
+
+  workspaces:
+    - name: artifacts
+
+  resources:
+    - name: app-image
+      type: image
+
+  tasks:
+    - name: fetch-credentials
+      taskRef:
+        name: git-get-credentials
+      workspaces:
+        - name: artifacts
+          workspace: artifacts
+      params:
+        - name: ibmcloud-api-key
+          value: $(params.ibmcloud-api-key)
+        - name: repository
+          value: $(params.repository)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+
+    - name: fetch-code
+      runAfter:
+        - fetch-credentials
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: artifacts
+          workspace: artifacts
+      params:
+        - name: repository
+          value: $(params.repository)
+        - name: branch
+          value: $(params.branch)
+        - name: revision
+          value: $(params.revision)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+
+    - name: icr-containerize
+      taskRef:
+        name: icr-containerize
+      runAfter:
+        - fetch-code
+      workspaces:
+        - name: source
+          workspace: artifacts
+      params:
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+        - name: additional-tags-script
+          value: |
+            # Include the clone task output variables in the environment
+            source /source/build.properties
+            # The script is providing tag(s) as output
+            # But logs can be written as error stderr
+            echo "Providing an image tag including git branch and commit" >&2
+            # Add a specific tag with branch and commit
+            echo "${BUILD_TIMESTAMP}-${GIT_BRANCH}-${GIT_COMMIT}"
+      resources:
+        outputs:
+          - name: built-image
+            resource: app-image
+
+    - name: update-inventory-task
+      taskRef:
+        name: inventory-update-version
+      runAfter:
+        - icr-containerize
+      workspaces:
+        - name: artifacts
+          workspace: artifacts
+      params:
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+        - name: inventory-repo
+          value: $(params.inventory-repo)
+        - name: version
+          value: $(params.version)
+        - name: repository
+          value: $(params.repository)
+        - name: repository-url
+          value: $(params.repository)
+        - name: commit-sha
+          value: $(tasks.code-fetch-code.results.git-commit)
+
+    - name: cleanup-task
+      taskRef:
+        name: cleanup
+      runAfter:
+        - icr-containerize
+      workspaces:
+        - name: artifacts
+          workspace: artifacts
+      params:
+        - name: ibmcloud-api-key
+          value: $(params.ibmcloud-api-key)

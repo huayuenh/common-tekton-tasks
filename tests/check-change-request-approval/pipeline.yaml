@@ -1,0 +1,30 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline-check-change-request-approval
+spec:
+  params:
+    - name: change-request-id
+    - name: pipeline-debug
+
+  tasks:
+    - name: setup
+      taskRef:
+        name: setup-check-change-request-approval
+      params:
+        - name: change-request-id
+          value: $(params.change-request-id)
+
+    - name: pipeline-check-cr-approval
+      taskRef:
+        name: servicenow-check-change-request-approval
+      runAfter:
+        - setup
+      params:
+        - name: servicenow-api-url
+          value: "https://watsontest.service-now.com/api/ibmwc/change"
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+        - name: change-request-id
+          value: $(tasks.setup.results.change-request-id)

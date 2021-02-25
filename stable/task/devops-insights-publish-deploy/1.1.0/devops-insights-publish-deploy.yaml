@@ -1,0 +1,177 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: devops-insights-publish-deploy
+  labels:
+    app.kubernetes.io/version: "1.1.0"
+    tekton.dev/deprecated: true
+spec:
+  description: |
+    This task publishes a deploy record to DevOps Insights
+  params:
+    - name: app-name
+      description: Logical application name for DevOps Insights
+    - name: toolchain-id
+      description: Toolchain service instance id - Default to the toolchain containing the CD Tekton PipelineRun currently executed
+      default: ""
+    - name: build-number
+      description: Devops Inisghts build number reference. Default to the CD Tekton Pipeline build number
+      default: ""
+    - name: environment
+      description: The environment where the pipeline job deployed the app.
+      default: ""
+    - name: doi-environment
+      description: The environment where the pipeline job deployed the app.
+      default: ""
+    - name: deploy-status
+      description: The deployment status (can be either pass | fail)
+      default: "pass"
+    - name: job-url
+      description: The url to the job's deployment logs. Default to the CD Tekton PipelineRun currently executed
+      default: ""
+    - name: app-url
+      description: The URL where the deployed app is running
+      default: ""
+    - name: ibmcloud-api
+      description: the ibmcloud api
+      default: https://cloud.ibm.com
+    - name: continuous-delivery-context-secret
+      description: name of the configmap containing the continuous delivery pipeline context secrets
+      default: "secure-properties"
+    - name: toolchain-apikey-secret-key
+      description: field in the secret that contains the api key used to access toolchain and DOI instance
+      default: "toolchain-apikey"
+    - name: break-glass-name
+      description: Name of the `ConfigMap` that holds Break-Glass mode settings
+      default: environment-properties
+    - name: break-glass-key
+      description: Key in the `break-glass-name` `ConfigMap` that holds the Break-Glass mode settings
+      default: break_glass
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+  steps:
+    - name: publish-deployrecord
+      image: ibmcom/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      env:
+        - name: IBM_CLOUD_API
+          value: $(params.ibmcloud-api)
+        - name: IBM_CLOUD_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.toolchain-apikey-secret-key)
+              optional: true
+        - name: BREAK_GLASS
+          valueFrom:
+            configMapKeyRef:
+              name: $(params.break-glass-name)
+              key: $(params.break-glass-key)
+              optional: true
+        - name: APP_NAME
+          value: $(params.app-name)
+        - name: TOOLCHAIN_ID
+          value: $(params.toolchain-id)
+        - name: BUILD_NUMBER
+          value: $(params.build-number)
+        - name: DEPLOY_STATUS
+          value: $(params.deploy-status)
+        - name: ENVIRONMENT
+          value: $(params.doi-environment)
+        - name: JOB_URL
+          value: $(params.job-url)
+        - name: PIPELINE_RUN_URL
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+        - name: DEFAULT_BUILD_NUMBER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/build-number']
+      workingDir: /artifacts
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ $PIPELINE_DEBUG == 1 ]; then
+          env
+          cat /cd-config/toolchain.json
+          trap env EXIT
+          set -x
+        fi
+
+        if [[ -n "$BREAK_GLASS" ]]; then
+          echo "Break-Glass mode is on, skipping the rest of the task..."
+          exit 0
+        fi
+
+        ##########################################################################
+        # Setting HOME explicitly to have ibmcloud plugins available
+        # doing the export rather than env definition is a workaround
+        # until https://github.com/tektoncd/pipeline/issues/1836 is fixed
+        export HOME="/root"
+        ##########################################################################
+        if [[ "$IBM_CLOUD_API" == *test* ]]; then
+          export IBM_CLOUD_DEVOPS_ENV=dev
+        fi
+
+        CURRENT_TOOLCHAIN_ID=$(jq -r '.toolchain_guid' /cd-config/toolchain.json)
+        DOI_IN_TOOLCHAIN=$(jq -e '[.services[] | select(.service_id=="draservicebroker")] | length' /cd-config/toolchain.json)
+
+        if [ "$DOI_IN_TOOLCHAIN" == 0 ]; then
+          if [ -z "$TOOLCHAIN_ID" ] || [ "$CURRENT_TOOLCHAIN_ID" == "$TOOLCHAIN_ID" ]; then
+            echo "No Devops Insights integration found in toolchain. Skipping ..."
+            exit 0
+          fi
+        fi
+
+        if [ -z "$ENVIRONMENT" ]; then
+          ENVIRONMENT=$(params.environment)
+        fi
+
+        # Default Toolchain ID if needed
+        if [ -z "$TOOLCHAIN_ID" ]; then
+          TOOLCHAIN_ID=$CURRENT_TOOLCHAIN_ID
+        fi
+
+        # Default Job URL if needed
+        if [ -z "$JOB_URL" ]; then
+          JOB_URL="$PIPELINE_RUN_URL"
+        fi
+
+        # Default build number if needed
+        if [ -z "$BUILD_NUMBER" ]; then
+          BUILD_NUMBER="$DEFAULT_BUILD_NUMBER"
+        fi
+
+        if [ "$(params.app-url)" ]; then
+          APP_URL=" --appurl \"$(params.app-url)\""
+        else
+          APP_URL=""
+        fi
+
+        export TOOLCHAIN_ID=${TOOLCHAIN_ID} # for doi plugin
+        ibmcloud login --apikey ${IBM_CLOUD_API_KEY} -a ${IBM_CLOUD_API} --no-region
+        ibmcloud doi publishdeployrecord \
+          --env "${ENVIRONMENT}" \
+          --status=${DEPLOY_STATUS} \
+          --joburl="${JOB_URL}" \
+          --buildnumber="${BUILD_NUMBER}" \
+          --logicalappname="${APP_NAME}" \
+          ${APP_URL}
+
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json

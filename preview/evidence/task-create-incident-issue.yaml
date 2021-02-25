@@ -1,0 +1,113 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: evidence-create-incident-issue
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: secret-name
+      description: The name of the secret in the workspace
+    - name: repository
+      description: The git repo url
+    - name: incident-issue-repo
+      description: The incident issue git repository
+    - name: task-name
+      description: The name of the examined task
+    - name: result-status
+      description: Passed or failed status from the task
+    - name: commit-hash
+      description: Commit hash
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+  results:
+    - name: issue-url
+      description: The link to the created issue, can be an empty string if there was no issue created/updated
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: REPOSITORY_URL
+        value: $(params.repository)
+      - name: ISSUE_REPO_URL
+        value: $(params.incident-issue-repo)
+      - name: PIPELINE_RUN_URL
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+  steps:
+    - name: create-incident-issue
+      image: ibmcom/pipeline-base-image:2.6
+      script: |
+          #!/bin/bash
+
+          if [ $PIPELINE_DEBUG == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          TOKEN=$(cat /secrets/$(params.secret-name))
+
+          source /scripts/retry_command.sh
+
+          retry $(params.retry-count) $(params.retry-delay) \
+            git clone https://${TOKEN}@github.ibm.com/cocoa/incident-script.git
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Cannot clone incident script repo. Please visit https://ibmtoolbox.statuspage.io for futher details"
+            exit $exit_code
+          fi
+
+          source incident-script/incident.sh
+
+          if [ $(params.result-status) == "failure" ]; then
+            retry $(params.retry-count) $(params.retry-delay) \
+              incident add "$(params.task-name)" "$(params.commit-hash)" "$PIPELINE_RUN_URL"
+
+            exit_code=$?
+
+            if [ $exit_code -ne 0 ]; then
+              echo "Error creating the incident issue. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+              exit $exit_code
+            fi
+
+            echo -n $ISSUE_URL > $(results.issue-url.path)
+            if [ $TOTAL_COUNT != 0 ]; then
+              echo "Issue already exists for pipelinerun"
+              echo "Issue first created at: ${ISSUE_CREATED_AT}"
+            else
+              echo Issue created:
+            fi
+            echo Issue URL: $ISSUE_URL
+          else
+            echo -n "" | tee $(results.issue-url.path)
+            echo "No issues created"
+          fi
+
+      volumeMounts:
+        - mountPath: /scripts
+          name: retry-command
+
+  workspaces:
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

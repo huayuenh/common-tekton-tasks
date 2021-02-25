@@ -1,0 +1,105 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: servicenow-check-change-request-approval
+  labels:
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  params:
+    - name: servicenow-api-url
+      description: The ServiceNow API URL you wish to use (test or live)
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: servicenow-api-token-secret-key
+      description: the servicenow api key from secrets
+      default: "servicenow-api-token"
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: change-request-id
+      description: ID of the current Change Request
+    - name: retry-count
+      description: retry count
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+
+  results:
+    - name: exit-code
+      description: The exit-code of the script
+    - name: status
+      description: The status based on exit-code
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+  steps:
+
+    - name: check-approval
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.0.3@sha256:6acbd2908813ddb3ab3cd9a77ead61fd2fa69c66d437c571ec7ffc3ebb426196
+      env:
+        - name: SERVICENOW_URL
+          value: $(params.servicenow-api-url)
+        - name: CHANGE_REQUEST_ID
+          value: $(params.change-request-id)
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        export SERVICENOW_TOKEN=$(cat "/secrets/$(params.servicenow-api-token-secret-key)")
+        export GHE_TOKEN=$(cat "/dynamic-secrets/$(params.git-api-token-key)")
+
+        source /scripts/retry_command.sh
+
+        retry $(params.retry-count) $(params.retry-delay) \
+          cocoa change-request check-approval
+
+        exit_code=$?
+
+        echo $exit_code | tee $(results.exit-code.path)
+
+        if [ $exit_code -eq 0 ]; then
+          echo -n success | tee $(results.status.path)
+        else
+          echo "Error getting change request approval state."
+          exit $exit_code
+        fi
+
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+        - name: retry-command
+          mountPath: /scripts
+
+  workspaces:
+    - name: dynamic-secrets
+      mountPath: /dynamic-secrets
+
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

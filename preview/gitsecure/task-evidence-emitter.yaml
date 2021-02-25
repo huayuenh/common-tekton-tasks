@@ -1,0 +1,136 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: gitsecure-evidence-emitter
+spec:
+  params:
+    - name: repository
+      description: the git repo
+    - name: revision
+      description: the revision
+      default: master
+    - name: commit-id
+      description: git commit id
+    - name: evidence-repo
+      description: audit-tree evidence collection repo
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: ibmcloud-api-key-secret-key
+      description: the IBM Cloud API key from secrets
+      default: "ibmcloud-api-key"
+  stepTemplate:
+    env:
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+  steps:
+    - name: vulnerability-evidence-emitter
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/gitsecure/audit-vulnerability-emitter:1.0.1
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          #!/bin/sh
+
+          IBM_CLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+
+          /gitsecure/audit-vulnerability-emitter \
+            -apikey "$IBM_CLOUD_API_KEY" \
+            -giturl "$(params.repository)" \
+            -gitbranch "$(params.revision)" \
+            -rigserviceapi http://169.47.180.157:30850 \
+            -evidencerepo "$(params.evidence-repo)" \
+            -jobid "$PIPELINE_RUN_ID" \
+            -commitid "$(params.commit-id)" \
+            -toolchaincfg /config/toolchain.json
+      volumeMounts:
+        - name: config-volume
+          mountPath: /config
+        - name: secrets
+          mountPath: /secrets
+
+    - name: bom-evidence-emitter
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/gitsecure/audit-bom-emitter:1.0.1
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          #!/bin/sh
+
+          IBM_CLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+
+          /gitsecure/audit-bom-emitter \
+            -apikey "$IBM_CLOUD_API_KEY" \
+            -giturl "$(params.repository)" \
+            -gitbranch "$(params.revision)" \
+            -rigserviceapi http://169.47.180.157:30850 \
+            -evidencerepo "$(params.evidence-repo)" \
+            -jobid "$PIPELINE_RUN_ID" \
+            -commitid "$(params.commit-id)" \
+            -toolchaincfg /config/toolchain.json
+      volumeMounts:
+        - name: config-volume
+          mountPath: /config
+        - name: secrets
+          mountPath: /secrets
+
+    - name: ossc-evidence-emitter
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/gitsecure/audit-ossc-emitter:1.0.1
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          #!/bin/sh
+
+          IBM_CLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+
+          /gitsecure/audit-ossc-emitter \
+            -apikey "$IBM_CLOUD_API_KEY" \
+            -giturl "$(params.repository)" \
+            -gitbranch "$(params.revision)" \
+            -rigserviceapi http://169.47.180.157:30850 \
+            -evidencerepo "$(params.evidence-repo)" \
+            -jobid "$PIPELINE_RUN_ID" \
+            -commitid "$(params.commit-id)" \
+            -toolchaincfg /config/toolchain.json
+      volumeMounts:
+        - name: config-volume
+          mountPath: /config
+        - name: secrets
+          mountPath: /secrets
+
+    - name: cis-evidence-emitter
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/gitsecure/audit-cis-emitter:1.0.1
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          #!/bin/sh
+
+          IBM_CLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+
+          /gitsecure/audit-cis-emitter \
+            -apikey "$IBM_CLOUD_API_KEY" \
+            -giturl "$(params.repository)" \
+            -gitbranch "$(params.revision)" \
+            -rigserviceapi http://169.47.180.157:30850 \
+            -evidencerepo "$(params.evidence-repo)" \
+            -jobid "$PIPELINE_RUN_ID" \
+            -commitid "$(params.commit-id)" \
+            -toolchaincfg /config/toolchain.json
+      volumeMounts:
+        - name: config-volume
+          mountPath: /config
+        - name: secrets
+          mountPath: /secrets
+
+  volumes:
+    - name: config-volume
+      configMap:
+        name: toolchain
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)

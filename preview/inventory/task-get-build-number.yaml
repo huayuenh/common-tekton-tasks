@@ -1,0 +1,71 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: inventory-get-build-number
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: app-name
+      description: name of the app to be deployed
+    - name: target
+      description: Target branch in the inventory repo.
+      default: "prod_candidate"
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  results:
+    - name: build-number
+      description: the build number which built the app of given version
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  steps:
+    - name: get-build-number
+      image: ibmcom/pipeline-base-image:2.6
+      script: |
+          #!/bin/bash
+          set -e -o pipefail;
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          GIT_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+          export INVENTORY_FOLDER=$(jq -r '.services[] | select(.toolchain_binding.name=="inventory-repo")
+          | .parameters.repo_name' /cd-config/toolchain.json)
+
+          git config --global user.email "tekton@example.com"
+          git config --global user.name "Tekton"
+          git clone "https://$GIT_TOKEN@github.ibm.com/cocoa/inventory-script.git"
+          export PATH="$(pwd)/inventory-script:$PATH"
+
+          cd /artifacts/$INVENTORY_FOLDER
+          inventory get "$(params.app-name)" "$(params.target)" build_number | tee $(results.build-number.path)
+
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json

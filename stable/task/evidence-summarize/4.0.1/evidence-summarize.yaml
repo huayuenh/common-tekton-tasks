@@ -1,0 +1,221 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: evidence-summarize
+  labels:
+    app.kubernetes.io/version: "4.0.1"
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: deployment-delta-list-path
+      description: Path to JSON list of application names in inventory
+    - name: target
+      description: Target branch in the inventory repo.
+    - name: toolchain-crn
+      description: the crn of the toolchain
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: inventory-url
+      description: The url of the inventory git repository
+    - name: evidence-repo-url
+      description: url to the evidence git repository
+    - name: include-cd-evidence
+      description: If 1, summarize will include CD evidence too
+      default: "0"
+    - name: break-glass-name
+      description: Name of the `ConfigMap` that holds Break-Glass mode settings
+      default: "environment-properties"
+    - name: break-glass-key
+      description: Key in the `break-glass-name` `ConfigMap` that holds the Break-Glass mode settings
+      default: "break_glass"
+    - name: backend
+      description: specify the source of the evidence summary ("git" or "cos")
+      default: "git"
+    - name: cos-bucket-name
+      default: ""
+      description: Bucket name in your Cloud Object Storage instance, used as an Evidence Locker
+    - name: cos-endpoint
+      default: ""
+      description: Endpoint of your Cloud Object Storage instance, used as an Evidence Locker
+    - name: toolchain-apikey-secret-key
+      default: "ibmcloud-api-key"
+    - name: continuous-delivery-context-secret
+      default: "secure-properties"
+    - name: pipeline-debug
+      description: pipeline debug mode
+      default: "0"
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /runtime-secrets
+
+  results:
+    - name: summary-path
+      description: the path of the evidence summary
+    - name: formatted-summary-path
+      description: path to the formatted, human-readable evidence summary
+    - name: deployment-ready
+      description: simple yes|no indicator of deployment readiness
+
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+
+  stepTemplate:
+    env:
+      - name: BACKEND
+        value: $(params.backend)
+      - name: EVIDENCE_REPO_URL
+        value: $(params.evidence-repo-url)
+      - name: INVENTORY_URL
+        value: $(params.inventory-url)
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: COS_BUCKET_NAME
+        value: $(params.cos-bucket-name)
+      - name: COS_ENDPOINT
+        value: $(params.cos-endpoint)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+      - name: PIPELINE_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-id']
+      - name: BREAK_GLASS
+        valueFrom:
+          configMapKeyRef:
+            name: $(params.break-glass-name)
+            key: $(params.break-glass-key)
+            optional: true
+  steps:
+
+    - name: evidence-summarize
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.1.8@sha256:de2d767a5295334959955b39a681cb78e103addd09c3d6c311fa53ad724fcaea
+      workingDir: $(workspaces.artifacts.path)
+      volumeMounts:
+        - mountPath: /secrets
+          name: secrets
+      script: |
+        #!/bin/bash
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        if [[ -n "$BREAK_GLASS" ]]; then
+          echo "Break-Glass mode is on, backend switched to git"
+          BACKEND="git"
+        fi
+
+        if [ "$BACKEND" == "cos" ]; then
+          export COS_API_KEY=$(cat "/secrets/$(params.toolchain-apikey-secret-key)")
+        fi
+
+        export NL=$'\n'
+        export GHE_TOKEN=$(cat "$(workspaces.secrets.path)/$(params.git-api-token-key)")
+        INVENTORY_REPO=$(echo "$INVENTORY_URL" | cut -f5 -d/)
+        INVENTORY_ORG=$(echo "$INVENTORY_URL" | cut -f4 -d/)
+        APPS="$(cat "$(workspaces.artifacts.path)/$(params.deployment-delta-list-path)")"
+        FULL_SUMMARY_PATH="./evidence_summary.json"
+        FULL_SUMMARY="{}"
+        SUMMARY_TO_UPLOAD_PATH="./summary.json"
+        DATE=$(date +%FT%TZ)
+
+        SUMMARY_TO_UPLOAD="$(jq --arg date $DATE \
+          --arg crn $(params.toolchain-crn) \
+          --arg pipelineid $PIPELINE_ID \
+          --arg pipelinerunid $PIPELINE_RUN_ID '
+          .version="1.0" |
+          .date=$date |
+          .toolchain_crn=$crn |
+          .pipeline_id=$pipelineid |
+          .pipeline_run_id=$pipelinerunid |
+          .evidences=[]
+          ' <<< "{}")"
+
+        for array_raw_item in $(echo "${APPS}" | jq -c '.[]'); do
+          APP_NAME=$(echo "${array_raw_item}" | jq -r '.')
+
+          PARAMS="--entry=\"$APP_NAME\" \
+          --label=\"${PIPELINE_RUN_ID}\" \
+          --property=\"pipeline_run_id\" \
+          --org=\"$INVENTORY_ORG\" \
+          --repo=\"$INVENTORY_REPO\""
+
+          echo "Getting pipeline_run_id property for application '$APP_NAME' from target '$(params.target)'..."
+          CI_PIPELINE_RUN_ID=$(cocoa inventory get $PARAMS | tr -d '"' )
+          PREFIX_LIST=ci/$CI_PIPELINE_RUN_ID
+
+          if [ "$(params.include-cd-evidence)" == 1 ]; then
+            PREFIX_LIST+=",$cd/$PIPELINE_RUN_ID"
+          fi
+
+          export EVIDENCE_REPO_NAME=$(echo "$EVIDENCE_REPO_URL" | cut -f5 -d/)
+          export EVIDENCE_REPO_ORG=$(echo "$EVIDENCE_REPO_URL" | cut -f4 -d/)
+
+          TEMP_JSON_PATH="$(echo $APP_NAME | sed 's/\//_/g')_temp_sum.json"
+
+          cocoa evidence summarize \
+            --backend="$BACKEND" \
+            --output="${TEMP_JSON_PATH}" \
+            --pipeline-run-id="$PIPELINE_RUN_ID" \
+            --toolchain-crn="$(params.toolchain-crn)" \
+            --prefix-list="$PREFIX_LIST"
+
+          EVIDENCES=$(cat ${TEMP_JSON_PATH} | jq -c '.evidences' )
+          FULL_SUMMARY=$(echo $FULL_SUMMARY | jq -c --arg appname $APP_NAME --argjson evidences $EVIDENCES '.[$appname] = $evidences')
+          SUMMARY_TO_UPLOAD=$(echo $SUMMARY_TO_UPLOAD | jq -c --argjson evidences $EVIDENCES '.evidences += $evidences' )
+        done
+
+        echo -n "$FULL_SUMMARY" > "$FULL_SUMMARY_PATH"
+
+        echo -n "$SUMMARY_TO_UPLOAD" > "$SUMMARY_TO_UPLOAD_PATH"
+        echo -n "$SUMMARY_TO_UPLOAD_PATH" > "$(results.summary-path.path)"
+
+        FAILURE_COUNT=$(jq '[.[] | .[] | select(.result == "failure")] | length' "$FULL_SUMMARY_PATH")
+
+        echo -n "yes" > "$(results.deployment-ready.path)"
+
+        if [ "$FAILURE_COUNT" != 0 ]; then
+          echo -n "no" > "$(results.deployment-ready.path)"
+        fi
+
+        #
+        # format summary into a human-readable format
+        #
+
+        FORMATTED_SUMMARY_PATH="./formatted_summary.txt"
+
+        formatted_summary=""
+
+        keys=$(cat "$FULL_SUMMARY_PATH" | jq -c 'keys')
+
+        for app in $(echo "${keys}" | jq -r '.[] '); do
+            formatted_summary+="Evidence summary for $app  \n\n"
+
+            for evidence in $(jq -c --arg app $app '.[$app] | .[]' "$FULL_SUMMARY_PATH"); do
+                result="$(echo $evidence | jq -r '.result')"
+                type="$(echo $evidence | jq -r '.evidence_type_id')"
+                url="$(echo $evidence | jq -r '.log[0].url')"
+
+                formatted_summary+="- ${type}: ${result} \n"
+                formatted_summary+="  ${url}  \n\n"
+            done
+        done
+
+        echo -e $formatted_summary > $FORMATTED_SUMMARY_PATH
+
+        echo Formatted Summary:
+        echo ""
+        cat $FORMATTED_SUMMARY_PATH
+        echo -n "$FORMATTED_SUMMARY_PATH" > $(results.formatted-summary-path.path)

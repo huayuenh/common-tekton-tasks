@@ -1,0 +1,191 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: evidence-add
+spec:
+  params:
+    - name: evidence-repo-url
+    - name: namespace
+      description: pipeline namespace
+    - name: evidence-name
+      description: name of the evidence
+    - name: task-step-name
+      description: The exact step name in the pipeline task. Used to set up the exact URL to the taskRun
+      default: ""
+    - name: evidence-type
+      description: type of the evidence
+    - name: evidence-type-version
+      description: version of the evidence type
+    - name: result
+      description: evidence result
+    - name: issues
+      description: evidence issue urls
+    - name: artifacts
+      default: ""
+    - name: toolchain-crn
+      description: name of the toolchain cloud resource
+      default: "null"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: pipeline-debug
+      description: pipeline debug mode
+      default: "0"
+    - name: git-api-token-key
+      description: The name of the secret in the workspace
+      default: "git-token"
+  stepTemplate:
+    env:
+      - name: ARTIFACTS
+        value: $(params.artifacts)
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-id']
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+      - name: PIPELINE_RUN_URL
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+  steps:
+    - name: setup-env
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      workingDir: "/steps"
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e -o pipefail
+
+          if [ "$PIPELINE_DEBUG" = 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          if [ -n "$ARTIFACTS" ]; then
+            artifacts_array=()
+
+            for artifact in $(echo $ARTIFACTS | jq -c '.[]') ; do
+              url=$(echo $artifact | jq -c -r '.url')
+              hash=$(echo $artifact | jq -c -r '.hash')
+              echo $url
+              echo $hash
+              artifacts_array+=("\"${url}:${hash}\"")
+            done
+
+            echo "artifacts_array=(${artifacts_array[*]})" >> ./steps.properties
+          fi
+
+      volumeMounts:
+        - mountPath: /steps
+          name: step-volume
+
+    - name: evidence-add-step
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:0.14
+      workingDir: "/steps"
+      env:
+        - name: STEP_NAME
+          value: $(params.task-step-name)
+        - name: NAMESPACE
+          value: $(params.namespace)
+        - name: EVIDENCE_TYPE
+          value: $(params.evidence-type)
+        - name: EVIDENCE_TYPE_VERSION
+          value: $(params.evidence-type-version)
+        - name: EVIDENCE_NAME
+          value: $(params.evidence-name)
+        - name: EVIDENCE_REPO_URL
+          value: $(params.evidence-repo-url)
+        - name: RESULT
+          value: $(params.result)
+        - name: TOOLCHAIN_CRN
+          value: $(params.toolchain-crn)
+        - name: ISSUES
+          value: $(params.issues)
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e -o pipefail
+
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          source /scripts/retry_command.sh
+
+          EVIDENCE_REPO_NAME=${EVIDENCE_REPO_URL##*/}
+          export EVIDENCE_REPO_NAME=${EVIDENCE_REPO_NAME%.git}
+          EVIDENCE_REPO_ORG=${EVIDENCE_REPO_URL%/*}
+          export EVIDENCE_REPO_ORG=${EVIDENCE_REPO_ORG##*/}
+
+          export GHE_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+          PIPELINE_RUN_URL=$(echo "$PIPELINE_RUN_URL" | sed -E "s/\/?(\?.*)/\/$EVIDENCE_NAME\1/")
+
+          if [ -n "$STEP_NAME" ]; then
+            PIPELINE_RUN_URL=$(echo "$PIPELINE_RUN_URL" | sed -E "s/\/?(\?.*)/\/$STEP_NAME\1/")
+          fi
+
+          ARTIFACT_OPTIONS=""
+          if [ -n "$ARTIFACTS" ]; then
+            source ./steps.properties
+            for artifact in "${artifacts_array[@]}" ; do
+                url=$(echo $artifact | cut -d : -f -2)
+                hash=$(echo $artifact | cut -d : -f 3-)
+                ARTIFACT_OPTIONS="${ARTIFACT_OPTIONS} --artifact ${url} ${hash}"
+            done
+            echo ARTIFACT_OPTIONS $ ARTIFACT_OPTIONS
+          fi
+
+          retry $(params.retry-count) $(params.retry-delay) \
+            cocoa evidence upload \
+              --backend=git \
+              --namespace="${NAMESPACE}" \
+              --evidence-name="${EVIDENCE_NAME}" \
+              --evidence-type="${EVIDENCE_TYPE}" \
+              --evidence-type-version="${EVIDENCE_TYPE_VERSION}" \
+              --result=${RESULT} \
+              --issue=${ISSUES} \
+              ${ARTIFACT_OPTIONS}
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error pushing to evidence locker repository. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+            exit $exit_code
+          fi
+
+      volumeMounts:
+        - mountPath: /scripts
+          name: retry-command
+        - mountPath: /steps
+          name: step-volume
+
+  workspaces:
+    - name: evidence-locker
+      mountPath: /evidence-locker
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: step-volume
+      emptyDir: {}
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

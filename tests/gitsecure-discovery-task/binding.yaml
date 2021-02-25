@@ -1,0 +1,7 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: binding-gitsecure-discovery-task
+spec:
+  params:

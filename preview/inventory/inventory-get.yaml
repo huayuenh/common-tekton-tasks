@@ -1,0 +1,95 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: inventory-get
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: name
+      description: The name of the inventory entry.
+    - name: target
+      description: Target branch in the inventory repo.
+    - name: property
+      description: The property to get from the target in the inventory.
+    - name: inventory-folder
+      description: The path to the inventory repository on the workspace.
+    - name: git-api-token-key
+      description: Github Enterprise API token secret name.
+      default: "git-token"
+    - name: pipeline-debug
+      description: Enables pipeline debug mode.
+      default: "0"
+    - name: default-value
+      description: The default data used as a fallback value if allow-default-value is set to true
+      default: ""
+    - name: allow-default-value
+      description: Allow using a default fallback value if it fails to get data from inventory
+      default: "false"
+
+  results:
+    - name: value
+      description: The value of the given property
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: INVENTORY_FOLDER
+        value: $(params.inventory-folder)
+      - name: DEFAULT_VALUE
+        value: $(params.default-value)
+      - name: ALLOW_DEFAULT
+        value: $(params.allow-default-value)
+  steps:
+    - name: get-property-from-inventory
+      image: ibmcom/pipeline-base-image:2.6
+      script: |
+          #!/bin/bash
+          set -o pipefail;
+
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          git config --global user.email "tekton@example.com"
+          git config --global user.name "Tekton"
+          GIT_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+          git clone "https://$GIT_TOKEN@github.ibm.com/cocoa/inventory-script.git"
+          PATH="$(pwd)/inventory-script:$PATH"
+          export PATH
+
+          cd /artifacts/"$INVENTORY_FOLDER"
+
+          echo "Getting '$(params.property)' property for application '$(params.name)' from target '$(params.target)'..."
+          VALUE=$(inventory get "$(params.name)" "$(params.target)" "$(params.property)")
+          EXIT_CODE=$?
+
+          if [[ -z "$RESULT" && "$ALLOW_DEFAULT" != "false" ]]; then
+            echo -n "$DEFAULT_VALUE" | tee "$(results.value.path)"
+            exit 0
+          fi;
+
+          echo -n "$VALUE" | tee "$(results.value.path)"
+          exit $EXIT_CODE
+
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json

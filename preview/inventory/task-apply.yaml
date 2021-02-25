@@ -1,0 +1,108 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: inventory-apply
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: change-request-id
+      descripton: unique servicenow change request id
+    - name: inventory-folder
+      description: directory name where the inventory located
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+
+  steps:
+    - name: merge
+      image: ibmcom/pipeline-base-image:2.6
+      env:
+        - name: CHANGE_REQUEST_ID
+          value: $(params.change-request-id)
+        - name: INVENTORY_FOLDER
+          value: $(params.inventory-folder)
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          #!/bin/bash
+
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          GIT_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+          git config --global user.email "tekton@example.com"
+          git config --global user.name "Tekton"
+
+          clone_inventory_script() {
+            git clone https://"$GIT_TOKEN"@github.ibm.com/cocoa/inventory-script.git
+            export PATH="$(pwd)/inventory-script:$PATH"
+          }
+
+          merge_inventory_branch() {
+            cd /artifacts/"$INVENTORY_FOLDER" || exit
+
+            inventory conclude "$CHANGE_REQUEST_ID" prod
+          }
+
+          source /scripts/retry_command.sh
+
+          retry $(params.retry-count) $(params.retry-delay) clone_inventory_script
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error cloning inventory repository. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+            exit $exit_code
+          fi
+
+          retry $(params.retry-count) $(params.retry-delay) merge_inventory_branch
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error merging the change request inventory branch. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+            exit $exit_code
+          fi
+
+      volumeMounts:
+        - mountPath: /scripts
+          name: retry-command
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

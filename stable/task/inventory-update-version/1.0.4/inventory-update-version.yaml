@@ -1,0 +1,149 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: inventory-update-version
+  labels:
+    app.kubernetes.io/version: "1.0.4"
+spec:
+  params:
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: version
+      description: the version of the application to be deployed
+      default: ""
+    - name: artifact
+      description: artifact that can be deployed according to this inventory update
+    - name: inventory-integration
+      description: The toolchain integration name of the inventory repository
+      default: "inventory-repo"
+    - name: inventory-repo
+      description: The inventory repository
+      default: ""
+    - name: app-name
+      description: application name to add to the change request
+    - name: repository-url
+      description: application repository url
+    - name: commit-sha
+      description: commit id
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+    - name: app-artifacts
+      description: arbitrary information to store in the inventory entry in JSON format
+      default: ""
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+      - name: BUILD_NUMBER
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/build-number']
+
+  steps:
+    - name: update-inventory
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.2.4@sha256:dc98cc52c0caede42149c08727147520e30e81fee543b8dd5939b45d06baa142
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+        - mountPath: /scripts
+          name: retry-command
+      env:
+        - name: ARTIFACT
+          value: $(params.artifact)
+        - name: VERSION
+          value: $(params.version)
+        - name: APP_NAME
+          value: $(params.app-name)
+        - name: COMMIT_SHA
+          value: $(params.commit-sha)
+        - name: INVENTORY_REPO
+          value: $(params.inventory-repo)
+        - name: REPOSITORY_URL
+          value: $(params.repository-url)
+        - name: APP_ARTIFACTS
+          value: $(params.app-artifacts)
+      script: |
+        #!/bin/bash
+
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        if [[ $INVENTORY_REPO == "" ]]; then
+          INVENTORY_REPO=$(jq -r '.services[] | select(.toolchain_binding.name == "$(params.inventory-integration)")
+            | .parameters.owner_id + "/" + .parameters.repo_name' /cd-config/toolchain.json)
+        fi
+
+        GHE_REPO=${INVENTORY_REPO##*/}
+        export GHE_REPO=${GHE_REPO%.git}
+        GHE_ORG=${INVENTORY_REPO%/*}
+        export GHE_ORG=${GHE_ORG##*/}
+
+        export GHE_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+        update_version() {
+
+          PARAMS="--artifact=\"$ARTIFACT\" \
+          --version=\"$VERSION\" \
+          --repository-url=\"$REPOSITORY_URL\" \
+          --pipeline-run-id=\"$PIPELINE_RUN_ID\" \
+          --commit-sha=\"$COMMIT_SHA\" \
+          --build-number=\"$BUILD_NUMBER\" \
+          --name=\"$APP_NAME\""
+
+          if [[ -n "$APP_ARTIFACTS" ]]; then
+            PARAMS="$PARAMS --app-artifacts='${APP_ARTIFACTS}'"
+          fi
+
+          eval cocoa inventory add $PARAMS
+        }
+
+        source /scripts/retry_command.sh
+
+        retry $(params.retry-count) $(params.retry-delay) update_version
+
+        exit_code=$?
+
+        if [ $exit_code -ne 0 ]; then
+          echo "Error adding an application for a given version to the inventory branch. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+          exit $exit_code
+        fi

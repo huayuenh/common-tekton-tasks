@@ -1,0 +1,130 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: compliance-helper-scripts
+  labels:
+    app.kubernetes.io/version: "1.0.0"
+data:
+  create_pipeline_task_url.sh: |
+    create_pipeline_task_url() {
+      pipeline_run_url="$1"
+      task_name="$2"
+      step_name="$3"
+
+      url=$(echo "$pipeline_run_url" | sed -E "s/\/?(\?.*)/\/$task_name\1/")
+
+      if [ -n "$step_name" ]; then
+        url=$(echo "$url" | sed -E "s/\/?(\?.*)/\/$step_name\1/")
+      fi
+
+      echo $url
+    }
+
+  create_doi_dataset_file.sh: |
+    create_doi_dataset_file() {
+      task_name=$1
+      title=$2
+      lifecycle_stage=$3
+
+      mkdir -p ./doi-evidence
+
+      DATASET_FILE="./doi-evidence/doi-dataset-$task_name.json"
+      DATASET_JSON=$(jq \
+        --arg key0 "custom_datasets" \
+        --argjson value0 "[{ \
+            \"lifecycle_stage\": \"${lifecycle_stage}\", \
+            \"type_of_test\": \"test\", \
+            \"label\": \"Evidence of ${title}\" \
+        }]" \
+        --arg key1 "policies" \
+        --argjson value1 "[]" \
+        '. | .[$key0]=$value0 | .[$key1]=$value1' \
+        <<<'{}')
+
+      echo "$DATASET_JSON" > "${DATASET_FILE}"
+
+      echo "${DATASET_FILE}"
+    }
+
+  ibmcloud_doi_update_policy.sh: |
+    ibmcloud_doi_update_policy() {
+      ibmcloud doi policies-update \
+        --file "$1" \
+        --toolchainid "$2"
+    }
+
+  create_doi_evidence_data.sh: |
+    create_doi_evidence_data() {
+      title="$1"
+      result="$2"
+
+      task_name=$title
+
+      mkdir -p ./doi-evidence
+
+      DATE=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+
+      if [ "$result" = "success" ]; then
+        FAILURES=0
+        PASSES=1
+      else
+        FAILURES=1
+        PASSES=0
+      fi
+
+      full_title="$title - aggregated results"
+
+      TEST_DATA=$(jq --arg key0 "stats" \
+          --argjson value0 "{ \
+          \"suites\": 1, \
+          \"tests\": 1, \
+          \"passes\": $PASSES, \
+          \"pending\": 0, \
+          \"failures\": $FAILURES, \
+          \"start\": \"${DATE}\", \
+          \"end\": \"${DATE}\" \
+        }" \
+        --arg key1 "tests" \
+        --argjson value1 "[{ \
+            \"title\": \"${title}\", \
+            \"fullTitle\": \"${full_title}\", \
+            \"duration\": 0, \
+            \"currentRetry\": 0, \
+            \"err\": {} \
+        }]" \
+        --arg key2 "pending" \
+        --argjson value2 "[]" \
+        '. | .[$key0]=$value0 | .[$key1]=$value1 | .[$key2]=$value2' \
+        <<<'{}')
+
+      if [ "$result" = "success" ]; then
+        TEST_DATA=$(echo $TEST_DATA | jq ".passes += [
+          {
+            \"title\": \"${title}\", \
+            \"fullTitle\": \"${full_title}\", \
+            \"duration\": 0, \
+            \"currentRetry\": 0, \
+            \"err\": {} \
+          }
+        ]")
+        TEST_DATA=$(echo $TEST_DATA | jq ".failures += []")
+      else
+        TEST_DATA=$(echo $TEST_DATA | jq ".failures += [
+          {
+            \"title\": \"${title}\", \
+            \"fullTitle\": \"${full_title}\", \
+            \"duration\": 0, \
+            \"currentRetry\": 0, \
+            \"err\": {} \
+          }
+        ]")
+        TEST_DATA=$(echo $TEST_DATA | jq ".passes += []")
+      fi
+
+      FILENAME="./doi-evidence/$task_name-evidence.json"
+
+      echo "$TEST_DATA" > "$FILENAME"
+
+      echo "$FILENAME"
+    }

@@ -1,0 +1,178 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: inventory-update-version
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: version
+      description: the version of the application to be deployed
+    - name: artifact
+      description: artifact that can be deployed according to this inventory update
+    - name: inventory-integration
+      description: The toolchain integration name of the inventory repository
+      default: "inventory-repo"
+    - name: inventory-repo
+      description: The inventory repository
+      default: ""
+    - name: repository
+      description: application name to add to the change request
+    - name: repository-url
+      description: application repository url
+    - name: commit-sha
+      description: commit id
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+      - name: BUILD_NUMBER
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/build-number']
+
+  steps:
+    - name: update-inventory
+      image: ibmcom/pipeline-base-image:2.6
+      env:
+        - name: INVENTORY_REPO
+          value: $(params.inventory-repo)
+        - name: VERSION
+          value: $(params.version)
+        - name: ARTIFACT
+          value: $(params.artifact)
+        - name: REPO
+          value: $(params.repository)
+        - name: COMMIT_SHA
+          value: $(params.commit-sha)
+        - name: REPOSITORY_URL
+          value: $(params.repository-url)
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          #!/bin/bash
+          set -e -o pipefail
+
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          GIT_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+          if [[ $INVENTORY_REPO == "" ]]; then
+            INVENTORY_REPO=$(jq -r '.services[] | select(.toolchain_binding.name == "$(params.inventory-integration)")
+              | .parameters.owner_id + "/" + .parameters.repo_name' /cd-config/toolchain.json)
+          fi
+
+          git config --global user.email "tekton@example.com"
+          git config --global user.name "Tekton"
+
+          clone_inventory_repo() {
+            git clone "https://$GIT_TOKEN@github.ibm.com/$INVENTORY_REPO.git" inventory
+          }
+
+          clone_inventory_script() {
+            git clone https://"$GIT_TOKEN"@github.ibm.com/cocoa/inventory-script.git
+            export PATH="$(pwd)/inventory-script:$PATH"
+          }
+
+          update_version() {
+
+            cd inventory
+
+            # workaround to have a root commit (so you can create a PR against this empty branch)
+            # later on we should probably clone a repo which has already a root commit
+            if [[ $(git branch | wc -l) -eq 0 ]]; then
+              git commit --allow-empty -m 'initial commit'
+              git push origin master
+            fi
+
+            if [ -z "$VERSION" ]; then
+              if [ -n "$APP_VERSION" ]; then
+                VERSION=$APP_VERSION
+              else
+                VERSION=$(git tag --points-at HEAD)
+                if [ -z "$VERSION" ]; then
+                  echo "Build version in unknown, build will be aborted"
+                  exit 1
+                fi
+              fi
+            fi
+            inventory add $REPO $VERSION $ARTIFACT
+          }
+
+          source /scripts/retry_command.sh
+
+          retry $(params.retry-count) $(params.retry-delay) clone_inventory_script
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error cloning the inventory script repository. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+            exit $exit_code
+          fi
+
+          retry $(params.retry-count) $(params.retry-delay) clone_inventory_repo
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error cloning the inventory repository. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+            exit $exit_code
+          fi
+
+          retry $(params.retry-count) $(params.retry-delay) update_version
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error adding an application for a given version to the inventory branch. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+            exit $exit_code
+          fi
+
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+        - mountPath: /scripts
+          name: retry-command
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

@@ -1,0 +1,45 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: assert-test-get-git-credentials
+spec:
+  params:
+    - name: repository
+      description: the git repo url with the .git suffix
+    - name: git-auth-user
+      description: git user depending on the service type user for authentication
+    - name: repo-name
+      description: the repository name, from the url
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+
+  steps:
+    - name: setup
+      image: ibmcom/pipeline-base-image:2.6
+      command: ["/bin/bash", "-c"]
+      workingDir: "/artifacts"
+      args:
+        - |
+          set -e -o pipefail;
+
+          if [ -z $(params.repository) ]; then
+            echo "repository is missing"
+            exit 1
+          fi
+
+          if [ -z $(params.git-auth-user) ]; then
+            echo "git-auth-user is missing"
+            exit 1
+          fi
+
+          if [ -z $(params.repo-name) ]; then
+            echo "repo-name is missing"
+            exit 1
+          fi
+
+          if [ -z $(cat "./git-token") ]; then
+            echo "GIT_TOKEN is missing"
+            exit 1
+          fi

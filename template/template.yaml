@@ -1,0 +1,7 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: template
+  documentation: https://github.ibm.com/one-pipeline/common-tekton-tasks/template/README.md
+spec:

@@ -1,0 +1,95 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: evidence-summarize
+  labels:
+    app.kubernetes.io/version: "2.0.0"
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: evidence-repo-path
+      description: path of the evidence repo
+      default: "."
+    - name: path-list
+      description: a list of paths separated by newline where evidences can be found
+    - name: toolchain-crn
+      description: the crn of the toolchain
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: evidence-repo-url
+      description: url to the evidence git repository
+    - name: pipeline-debug
+      description: pipeline debug mode
+      default: "0"
+
+  results:
+    - name: summary-path
+      description: the path of the evidence summary
+    - name: failure-count
+      description: Number of failures in evidence
+
+  stepTemplate:
+    env:
+      - name: EVIDENCE_REPO_URL
+        value: $(params.evidence-repo-url)
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PATH_LIST
+        value: $(params.path-list)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+
+  steps:
+    - name: evidence-summarize
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.1.2@sha256:daee352e1bafc11303f00c0669281493c6d266dc76ea505070a5d6951a0f5cc9
+      workingDir: $(workspaces.evidence-locker.path)/$(params.evidence-repo-path)/
+      script: |
+        #!/bin/bash
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        SUMMARY_PATH="raw/cd/$PIPELINE_RUN_ID"
+
+        if [ ! -d "$SUMMARY_PATH" ]; then
+          mkdir $SUMMARY_PATH
+        fi
+
+        FULL_SUMMARY_PATH="$SUMMARY_PATH/summary.json"
+        PREFIX_LIST=$(echo $PATH_LIST | sed 's/ /,/g')
+
+        export EVIDENCE_REPO_NAME=$(echo "$EVIDENCE_REPO_URL" | cut -f5 -d/)
+        export EVIDENCE_REPO_ORG=$(echo "$EVIDENCE_REPO_URL" | cut -f4 -d/)
+        export GHE_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+        cocoa evidence summarize \
+          --backend="git" \
+          --output="$FULL_SUMMARY_PATH" \
+          --pipeline-run-id="$PIPELINE_RUN_ID" \
+          --toolchain-crn="$(params.toolchain-crn)" \
+          --prefix-list=$PREFIX_LIST
+
+        echo -n "$FULL_SUMMARY_PATH" > $(results.summary-path.path)
+
+    - name: count-failures
+      image: ibmcom/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      workingDir: $(workspaces.evidence-locker.path)/$(params.evidence-repo-path)/
+      script: |
+        #!/bin/bash
+
+        FAILURE_COUNT=$(jq '[.evidences[] | select(.result=="failure")] | length' "raw/cd/$PIPELINE_RUN_ID/summary.json")
+
+        echo -n "$FAILURE_COUNT" > "$(results.failure-count.path)"
+
+  workspaces:
+    - name: evidence-locker
+    - name: secrets
+      mountPath: /secrets

@@ -1,0 +1,123 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: evidence-summarize
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: evidence-repo-path
+      description: path of the evidence repo
+      default: "."
+    - name: path-list
+      description: a list of paths separated by newline where evidences can be found
+    - name: toolchain-crn
+      description: the crn of the toolchain
+    - name: pipeline-debug
+      description: pipeline debug mode
+      default: "0"
+
+  results:
+    - name: summary-path
+      description: the path of the evidence summary
+    - name: failure-count
+      description: Number of failures in evidence
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+
+  steps:
+    - name: pull-latest-inventory
+      image: ibmcom/pipeline-base-image:2.6
+      workingDir: $(workspaces.evidence-locker.path)/$(params.evidence-repo-path)/
+      script: |
+        #!/bin/bash
+
+        set -e -o pipefail
+
+        if [ $PIPELINE_DEBUG == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        # this should be removed as soon as we use cocoa cli to summarize evidence properly
+        git pull
+
+    - name: evidence-summarize-step
+      image: ibmcom/pipeline-base-image:2.6
+      workingDir: $(workspaces.evidence-locker.path)/$(params.evidence-repo-path)/
+      env:
+        - name: TOOLCHAIN_CRN
+          value: $(params.toolchain-crn)
+        - name: PATH_LIST
+          value: $(params.path-list)
+      script: |
+          #!/usr/bin/env python3
+
+          import os
+          import json
+          from datetime import datetime
+
+          toolchain_crn = os.environ['TOOLCHAIN_CRN']
+          pipeline_run_id = os.environ['PIPELINE_RUN_ID']
+          paths = os.environ['PATH_LIST'].split('\n')
+
+          now = datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')
+          summarized_evidences = []
+
+          for path in paths:
+            if not path:
+              continue
+            path = os.path.join('raw', path)
+            for subdir, dirs, files in os.walk(path):
+              for file in files:
+                filepath = os.path.join(subdir, file)
+                if filepath.endswith('.json'):
+                  with open(filepath) as json_file:
+                    data = json.load(json_file)
+                    if 'evidence_type_id' in data:
+                      print('Summarizing evidence: ' + filepath)
+                      summarized_evidences.append(data)
+
+          evidence_summary = {
+            'date': now,
+            'version': '1.0',
+            'pipeline_run_id': pipeline_run_id,
+            'toolchain_crn': toolchain_crn,
+            'evidences': summarized_evidences,
+          }
+
+          outpath = os.path.join('raw', 'cd', pipeline_run_id)
+          if not os.path.isdir(outpath):
+            os.makedirs(outpath)
+
+          summarypath = os.path.join(outpath, 'summary.json')
+          with open(summarypath, 'w') as out:
+            json.dump(evidence_summary, out)
+
+          print('Evidence summary saved under: ' + summarypath)
+          print('Summary will be pushed to the evidence locker repository in the next step!')
+          print(summarypath, file = open('$(results.summary-path.path)', 'w+'), end='')
+
+    - name: count-failures
+      image: ibmcom/pipeline-base-image:2.6
+      workingDir: $(workspaces.evidence-locker.path)/$(params.evidence-repo-path)/
+      script: |
+          #!/bin/bash
+          DEPLOYMENT_READY="yes"
+
+          FAILURE_COUNT=$(jq '[.evidences[] | select(.result=="failure")] | length' "raw/cd/$PIPELINE_RUN_ID/summary.json")
+
+          echo -n "${FAILURE_COUNT}" > "$(results.failure-count.path)"
+
+  workspaces:
+    - name: evidence-locker

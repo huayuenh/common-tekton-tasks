@@ -1,0 +1,155 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: devops-insights-publish-build
+  labels:
+    app.kubernetes.io/version: 1.0.1
+spec:
+  description: |
+    This task publishes a build record in DevOps Insights.
+  params:
+    - name: app-name
+      description: The app name of the build record.
+    - name: toolchain-id
+      description: Toolchain ID where the DevOps Insights service is located. In case it's missing, the current toolchain will be used.
+      default: ""
+    - name: build-number
+      description: The build number of the build record in DevOps Insights. In case it's missing, the current build number will be used.
+      default: ""
+    - name: build-status
+      description: The status (`pass` or `fail`).
+      default: "pass"
+    - name: git-repository
+      description: The repository url of the build record.
+    - name: git-branch
+      description: The branch of the build record.
+    - name: git-commit
+      description: The commit hash of the build record.
+    - name: job-url
+      description: The URL of the build job. In case it's missing, the current job URL will be used.
+      default: ""
+    - name: api-endpoint
+      description: The IBM Cloud API endpoint.
+      default: https://cloud.ibm.com
+    - name: secret-name
+      description: The name of the k8s `Secret` which contains the IBM Cloud API Key.
+      default: "secure-properties"
+    - name: secret-key
+      description: The key in `secret-name` which contains the IBM Cloud API Key.
+      default: "toolchain-apikey"
+    - name: pipeline-debug
+      description: Enable pipeline debug mode.
+      default: "0"
+    - name: break-glass-name
+      description: Name of the `ConfigMap` that holds Break-Glass mode settings
+      default: environment-properties
+    - name: break-glass-key
+      description: Key in the `break-glass-name` `ConfigMap` that holds the Break-Glass mode settings
+      default: break_glass
+
+  steps:
+    - name: publish-build-record
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      env:
+        - name: PIPELINE_DEBUG
+          value: $(params.pipeline-debug)
+        - name: IBM_CLOUD_API
+          value: $(params.api-endpoint)
+        - name: IBMCLOUD_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: $(params.secret-name)
+              key: $(params.secret-key)
+              optional: true
+        - name: BREAK_GLASS
+          valueFrom:
+            configMapKeyRef:
+              name: $(params.break-glass-name)
+              key: $(params.break-glass-key)
+              optional: true
+        - name: APP_NAME
+          value: $(params.app-name)
+        - name: TOOLCHAIN_ID
+          value: $(params.toolchain-id)
+        - name: BUILD_NUMBER
+          value: $(params.build-number)
+        - name: BUILD_STATUS
+          value: $(params.build-status)
+        - name: GIT_URL
+          value: $(params.git-repository)
+        - name: GIT_BRANCH
+          value: $(params.git-branch)
+        - name: GIT_COMMIT
+          value: $(params.git-commit)
+        - name: JOB_URL
+          value: $(params.job-url)
+        - name: PIPELINE_RUN_URL
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+        - name: DEFAULT_BUILD_NUMBER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/build-number']
+      script: |
+        #!/usr/bin/env bash
+        set -e -o pipefail
+
+        if [[ "$PIPELINE_DEBUG" == 1 ]]; then
+          set -x
+        fi
+
+        if [[ -n "$BREAK_GLASS" ]]; then
+          echo "Break-Glass mode is on, skipping the rest of the task..."
+          exit 0
+        fi
+
+        CURRENT_TOOLCHAIN_ID=$(jq -r '.toolchain_guid' /cd-config/toolchain.json)
+        DOI_IN_TOOLCHAIN=$(jq -r '[.services[] | select(.service_id=="draservicebroker")] | length' /cd-config/toolchain.json)
+
+        if [[ "$DOI_IN_TOOLCHAIN" == 0 ]]; then
+          if [[ -z "$TOOLCHAIN_ID" || "$CURRENT_TOOLCHAIN_ID" == "$TOOLCHAIN_ID" ]]; then
+            echo "No Devops Insights integration found in toolchain. Skipping ..."
+            exit 0
+          fi
+        fi
+
+        # Default Toolchain ID if needed
+        if [ -z "$TOOLCHAIN_ID" ]; then
+          TOOLCHAIN_ID=$CURRENT_TOOLCHAIN_ID
+        fi
+
+        # Default Job URL if needed
+        if [ -z "$JOB_URL" ]; then
+          JOB_URL="$PIPELINE_RUN_URL"
+        fi
+
+        # Default build number if needed
+        if [ -z "$BUILD_NUMBER" ]; then
+          BUILD_NUMBER="$DEFAULT_BUILD_NUMBER"
+        fi
+
+        ibmcloud login -a "$IBM_CLOUD_API" --no-region
+
+        ibmcloud doi publishbuildrecord \
+          --toolchainid="$TOOLCHAIN_ID" \
+          --logicalappname="$APP_NAME" \
+          --buildnumber="$BUILD_NUMBER" \
+          --branch="$GIT_BRANCH" \
+          --repositoryurl="$GIT_URL" \
+          --commitid="$GIT_COMMIT" \
+          --status="$BUILD_STATUS" \
+          --joburl="$JOB_URL"
+
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json

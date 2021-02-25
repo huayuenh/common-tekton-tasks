@@ -1,0 +1,246 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: skopeo-copy-image
+  labels:
+    app.kubernetes.io/version: 1.0.1
+spec:
+  params:
+    - name: source-image-name
+      description: Source image name. required if no source-image-repository value provided
+      default: ""
+    - name: source-image-repository
+      description: the source image repository
+      default: ""
+    - name: source-image-digest
+      description: the source image digest (sha-256 hash)
+    - name: target-image-name
+      description: Target image name. required if no target-image-repository value provided
+      default: ""
+    - name: target-image-repository
+      description: the target target repository
+      default: ""
+    - name: image-tags
+      description: the tags for the target image
+      default: "latest"
+    - name: source-registry-url
+      description: the source registry url
+      default: ""
+    - name: target-registry-url
+      description: the target registry url
+      default: ""
+    - name: source-registry-namespace
+      description: source container registry namespace.
+      default: ""
+    - name: target-registry-namespace
+      description: target container registry namespace.
+      default: ""
+    - name: source-password-secret-key
+      descreption: source registry api-key
+      default: source-password-secret-key
+    - name: destination-password-secret-key
+      descreption: destination registry api-key
+      default: destination-password-secret-key
+    - name: source-username
+      descreption: source container registry service authentication email or username
+    - name: target-username
+      description: target container registry service authentication email or username
+    - name: source-email
+      description: source container registry service authentication email
+    - name: target-email
+      description: target container registry service authentication email or username
+    - name: continuous-delivery-context-secret
+      description: name of the secret containing the continuous delivery pipeline context secrets
+      default: secure-properties
+    - name: continuous-delivery-context-environment
+      description: name of the configmap containing the continuous delivery pipeline context environment properties
+      default: environment-properties
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+  workspaces:
+    - name: source
+      description: A workspace containing the source (Dockerfile, Docker context) to create the image
+      mountPath: /artifacts
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+  steps:
+    - name: setup
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      workingDir: /steps
+      env:
+        - name: SOURCE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.source-password-secret-key)
+        - name: TARGET_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.destination-password-secret-key)
+        - name: SOURCE_USERNAME
+          value: $(params.source-username)
+        - name: TARGET_USERNAME
+          value: $(params.target-username)
+        - name: SOURCE_EMAIL
+          value: $(params.source-email)
+        - name: TARGET_EMAIL
+          value: $(params.target-email)
+        - name: SOURCE_IMAGE_DIGEST
+          value: $(params.source-image-digest)
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+        - mountPath: /steps
+          name: steps-volume
+        - mountPath: /secrets
+          name: secure-properties
+        - mountPath: /properties
+          name: environment-properties
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ $PIPELINE_DEBUG == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+        fi
+
+        SOURCE_IMAGE_REPOSITORY=$(params.source-image-repository)
+        if [ "$SOURCE_IMAGE_REPOSITORY" ]; then
+          image="$(echo "$SOURCE_IMAGE_REPOSITORY" | tr '\/' ' ')"
+          read -ra repo <<< $image
+          export SOURCE_REGISTRY_URL=$(echo "${repo[0]}")
+        else
+          export SOURCE_REGISTRY_URL=$(params.source-registry-url)
+          if [ -z "$SOURCE_REGISTRY_URL" ]; then
+            echo "No source registry url provided"
+            exit 1
+          fi
+
+          SOURCE_IMAGE_NAME=$(params.source-image-name)
+          if [ -z "$SOURCE_IMAGE_NAME" ]; then
+            echo "No source image name provided"
+            exit 1
+          fi
+
+          SOURCE_REGISTRY_NAMESPACE=$(params.source-registry-namespace)
+          if [ "$SOURCE_REGISTRY_NAMESPACE" ]; then
+            SOURCE_IMAGE_REPOSITORY="${SOURCE_REGISTRY_URL}/${SOURCE_REGISTRY_NAMESPACE}/${SOURCE_IMAGE_NAME}"
+          else
+            SOURCE_IMAGE_REPOSITORY="${SOURCE_REGISTRY_URL}/${SOURCE_IMAGE_NAME}"
+          fi
+        fi
+
+        TARGET_IMAGE_REPOSITORY=$(params.target-image-repository)
+        if [ "$TARGET_IMAGE_REPOSITORY" ]; then
+          image="$(echo "$TARGET_IMAGE_REPOSITORY" | tr '\/' ' ')"
+          read -ra repo <<< $image
+          export TARGET_REGISTRY_URL=$(echo "${repo[0]}")
+        else
+          export TARGET_REGISTRY_URL=$(params.target-registry-url)
+          if [ -z "$TARGET_REGISTRY_URL" ]; then
+            echo "No target registry url provided"
+            exit 1
+          fi
+
+          TARGET_IMAGE_NAME=$(params.target-image-name)
+          if [ -z "$TARGET_IMAGE_NAME" ]; then
+            if [ "$SOURCE_IMAGE_NAME" ]; then
+              TARGET_IMAGE_NAME=$(params.source-image-name)
+            else
+              image="$(echo "$SOURCE_IMAGE_REPOSITORY" | tr '\/' ' ')"
+              read -ra repo <<< $image
+              TARGET_IMAGE_NAME=$(echo "${repo[${#repo[@]}-1]}")
+            fi
+          fi
+
+          TARGET_REGISTRY_NAMESPACE=$(params.target-registry-namespace)
+          if [ "$TARGET_REGISTRY_NAMESPACE" ]; then
+            TARGET_IMAGE_REPOSITORY="${TARGET_REGISTRY_URL}/${TARGET_REGISTRY_NAMESPACE}/${TARGET_IMAGE_NAME}"
+          else
+            TARGET_IMAGE_REPOSITORY="${TARGET_REGISTRY_URL}/${TARGET_IMAGE_NAME}"
+          fi
+        fi
+
+        export SOURCE_IMAGE="docker://${SOURCE_IMAGE_REPOSITORY}@${SOURCE_IMAGE_DIGEST}"
+        export TARGET_IMAGE="docker://${TARGET_IMAGE_REPOSITORY}"
+
+        kubectl create secret --dry-run=true --output=json \
+          docker-registry registry-dockerconfig-secret \
+          --docker-server=${SOURCE_REGISTRY_URL} \
+          --docker-password=${SOURCE_PASSWORD} \
+          --docker-username=${SOURCE_USERNAME} --docker-email=${SOURCE_EMAIL} | \
+        jq -r '.data[".dockerconfigjson"]' | base64 -d > config.json
+
+        kubectl create secret --dry-run=true --output=json \
+          docker-registry registry-dockerconfig-secret \
+          --docker-server=${TARGET_REGISTRY_URL} \
+          --docker-password=${TARGET_PASSWORD} \
+          --docker-username=${TARGET_USERNAME} --docker-email=${TARGET_EMAIL} | \
+        jq -r '.data[".dockerconfigjson"]' | base64 -d > target-auth-config.json
+
+        target_auth_config="$(jq -r -c \
+            --arg host "${TARGET_REGISTRY_URL}" \
+            '.auths[$host]' \
+            target-auth-config.json)"
+
+        echo "$(jq -r -c \
+        --arg host "${TARGET_REGISTRY_URL}" \
+        --argjson data "${target_auth_config}" \
+        '.auths[$host] = $data' \
+        config.json)" > config.json
+
+        echo "SOURCE_IMAGE=${SOURCE_IMAGE}" >> next-step-env.properties
+        echo "TARGET_IMAGE=${TARGET_IMAGE}" >> next-step-env.properties
+        echo "SOURCE_REGISTRY_URL=${SOURCE_REGISTRY_URL}" >> next-step-env.properties
+        echo "TARGET_REGISTRY_URL=${TARGET_REGISTRY_URL}" >> next-step-env.properties
+
+    - name: skopeo-copy
+      image: quay.io/skopeo/stable:v1.2.0@sha256:1804d93ffd86c696be657e335031ab4a3a7afd19103cc46cb2b830598ef1a85d
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ $PIPELINE_DEBUG == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+        fi
+
+        source /steps/next-step-env.properties
+        skopeo copy --authfile /steps/config.json --all $SOURCE_IMAGE $TARGET_IMAGE
+
+        IFS=','
+        read -ra image_tags <<< "$(params.image-tags)"
+        for image_tag in "${image_tags[@]}"; do
+          image_tag="$(echo $image_tag | sed -e 's/^[[:space:]]*//')"
+          IMAGE="${TARGET_IMAGE}:$image_tag"
+          skopeo copy --authfile /steps/config.json --all $SOURCE_IMAGE $IMAGE
+        done
+
+  volumes:
+    - name: secure-properties
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+    - name: environment-properties
+      configMap:
+        name: $(params.continuous-delivery-context-environment)
+    - name: steps-volume
+      emptyDir: {}
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json

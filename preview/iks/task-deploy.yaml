@@ -1,0 +1,283 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: iks-deploy
+spec:
+  params:
+    - name: cluster-name
+      description: The IBM Cloud cluster name
+    - name: cluster-region
+      description: The IBM Cloud region for your cluster
+    - name: cluster-namespace
+      description: The IBM Cloud cluster namespace
+      default: "default"
+    - name: ibmcloud-api
+      description: the ibmcloud api endpoint
+      default: "https://cloud.ibm.com"
+    - name: deployment-file
+      description: Kubernetes Deployment resource file to use for deploy
+      default: "deployment.yml"
+    - name: allow-create-route
+      description: Allow the task to create a Route resource (if there is none)
+        to access the deployed app
+      default: "false"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: ibmcloud-api-key-secret-key
+      description: the IBM Cloud API key from secrets
+      default: "ibmcloud-api-key"
+    - name: image-url
+      description: URL of image to deploy
+      default: ""
+    - name: image-tag
+      description: Tags of the created image
+      default: ""
+    - name: image-name
+      description: Name of the created image
+      default: ""
+    - name: registry-url
+      description: Container registry URL
+      default: ""
+    - name: registry-namespace
+      description: Container registry namespace
+      default: ""
+    - name: app-directory
+      description: Path of the application
+      default: ""
+
+  results:
+    - name: app-url
+      description: the url where the deployed app is available
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  steps:
+    - name: deploy-to-kubernetes
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      env:
+        - name: API
+          value: $(params.ibmcloud-api)
+        - name: REGION
+          value: $(params.cluster-region)
+        - name: HOME
+          value: "/root"
+        - name: DEPLOYMENT_FILE
+          value: $(params.deployment-file)
+        - name: CLUSTER_NAMESPACE
+          value: $(params.cluster-namespace)
+        - name: PIPELINE_KUBERNETES_CLUSTER_NAME
+          value: $(params.cluster-name)
+        - name: ALLOW_CREATE_ROUTE
+          value: $(params.allow-create-route)
+      command: ["/bin/bash", "-c"]
+      # yamllint disable rule:line-length
+      args:
+        - |
+          #!/bin/bash
+          set -e -o pipefail
+
+          if [ $PIPELINE_DEBUG == 1 ]; then
+            env
+            cat /cd-config/toolchain.json
+            trap env EXIT
+            set -x
+          fi
+
+          if [ -n "$(params.image-url)" ]; then
+            IMAGE="$(params.image-url)"
+            REGISTRY_URL=$(echo "$IMAGE" | cut -f1 -d/)
+            REGISTRY_NAMESPACE=$(echo "$IMAGE" | cut -f2 -d/)
+            IMAGE_NAME=$(echo "$IMAGE" | cut -f1 -d: | cut -f3 -d/)
+            IMAGE_TAG=$(echo "$IMAGE" | cut -f2 -d:)
+          fi
+
+          if [ -n "$(params.image-tag)" ]; then
+            IMAGE_TAG=$(params.image-tag)
+          fi
+
+          if [ -n "$(params.image-name)" ]; then
+            IMAGE_NAME=$(params.image-name)
+          fi
+
+          if [ -n "$(params.registry-url)" ]; then
+            REGISTRY_URL=$(params.registry-url)
+          fi
+
+          if [ -n "$(params.registry-namespace)" ]; then
+            REGISTRY_NAMESPACE=$(params.registry-namespace)
+          fi
+
+          APP_DIRECTORY=$(params.app-directory)
+          IBM_CLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+          # if registry region is in the 'ibm:yp:<region>' just keep the region part
+          export REGION=$(echo "${REGION}" | awk -F ":" '{print $NF}')
+          ibmcloud login -a "$API" -r "$REGION" --apikey "$IBM_CLOUD_API_KEY"
+          $(ibmcloud ks cluster config --cluster "${PIPELINE_KUBERNETES_CLUSTER_NAME}" --export)
+          if which oc > /dev/null && ibmcloud ks cluster get "${PIPELINE_KUBERNETES_CLUSTER_NAME}" --json | jq -e '.type=="openshift"' > /dev/null; then oc login -u apikey -p "${IBM_CLOUD_API_KEY}" ; fi
+
+          #!/bin/bash
+          # uncomment to debug the script
+          #set -x
+          # copy the script below into your app code repo (e.g. ./scripts/deploy_kubectl.sh) and 'source' it from your pipeline job
+          #    source ./scripts/deploy_kubectl.sh
+          # alternatively, you can source it from online script:
+          #    source <(curl -sSL "https://raw.githubusercontent.com/open-toolchain/commons/master/scripts/deploy_kubectl.sh")
+          # ------------------
+          # source: https://raw.githubusercontent.com/open-toolchain/commons/master/scripts/deploy_kubectl.sh
+
+          # Input env variables
+          DEPLOYMENT_FILE="/artifacts/${APP_DIRECTORY}/${DEPLOYMENT_FILE}"
+          echo "IMAGE_NAME=${IMAGE_NAME}"
+          echo "IMAGE_TAG=${IMAGE_TAG}"
+          echo "REGISTRY_URL=${REGISTRY_URL}"
+          echo "REGISTRY_NAMESPACE=${REGISTRY_NAMESPACE}"
+          echo "DEPLOYMENT_FILE=${DEPLOYMENT_FILE}"
+
+          # Input env variables from pipeline job
+          echo "PIPELINE_KUBERNETES_CLUSTER_NAME=${PIPELINE_KUBERNETES_CLUSTER_NAME}"
+          if [ -z "${CLUSTER_NAMESPACE}" ]; then CLUSTER_NAMESPACE=default ; fi
+          echo "CLUSTER_NAMESPACE=${CLUSTER_NAMESPACE}"
+
+          echo "=========================================================="
+          echo "DEPLOYING using manifest"
+          echo -e "Updating ${DEPLOYMENT_FILE} with image name: ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}"
+          if [ -z "${DEPLOYMENT_FILE}" ]; then DEPLOYMENT_FILE=deployment.yml ; fi
+          if [ -f ${DEPLOYMENT_FILE} ]; then
+              sed -i "s~^\([[:blank:]]*\)image:.*$~\1image: ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}~" ${DEPLOYMENT_FILE}
+              cat ${DEPLOYMENT_FILE}
+          else
+              echo -e "${red}Kubernetes deployment file '${DEPLOYMENT_FILE}' not found${no_color}"
+              exit 1
+          fi
+
+          set -x
+          kubectl apply --namespace "${CLUSTER_NAMESPACE}" -f "${DEPLOYMENT_FILE}"
+          set +x
+
+          IMAGE_REPOSITORY=${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}
+
+          echo ""
+          echo "=========================================================="
+
+          DEPLOYMENT_NAME=$(kubectl get deploy --namespace "${CLUSTER_NAMESPACE}" -o json | jq -r '.items[] | select(.spec.template.spec.containers[]?.image | test("'"${IMAGE_REPOSITORY}:${IMAGE_TAG}"'(@.+|$)")) | .metadata.name' )
+
+          echo -e "CHECKING deployment rollout of ${DEPLOYMENT_NAME}"
+          echo ""
+
+          set -x
+          if kubectl rollout status "deploy/${DEPLOYMENT_NAME}" --watch=true --timeout=${ROLLOUT_TIMEOUT:-"150s"} --namespace "${CLUSTER_NAMESPACE}"; then
+            STATUS="pass"
+          else
+            STATUS="fail"
+          fi
+          set +x
+
+          # Dump events that occured during the rollout
+          echo "SHOWING last events"
+          kubectl get events --sort-by=.metadata.creationTimestamp -n "${CLUSTER_NAMESPACE}"
+
+          if [ "$STATUS" == "fail" ]; then
+            echo "DEPLOYMENT FAILED"
+            echo "Showing registry pull quota"
+            ibmcloud cr quota || true
+            exit 1
+          fi
+
+          set -x
+
+          echo "Trying to get app name..."
+
+          app_name_retries="5"
+          app_name_iteration=1
+
+          function get_app {
+              APP=$(kubectl get pods --namespace "${CLUSTER_NAMESPACE}" -o json | jq -r '[ .items[] | select(.spec.containers[]?.image=="'"${IMAGE_REPOSITORY}:${IMAGE_TAG}"'") | .metadata.labels.app] [1]')
+              echo "$APP"
+          }
+
+          while [ $app_name_iteration -le $app_name_retries ]
+          do
+              APP_NAME=$(get_app)
+
+              if [ "$APP_NAME" != null ]; then
+                  break
+              else
+                  sleep 1
+              fi
+              app_name_iteration=$(( $app_name_iteration + 1 ))
+
+              if [ $app_name_iteration -gt $app_name_retries ]; then
+                  echo "Failed to get app name!"
+              fi
+          done
+
+          echo -e "APP: ${APP_NAME}"
+          echo "DEPLOYED PODS:"
+          kubectl describe pods --selector app="${APP_NAME}" --namespace "${CLUSTER_NAMESPACE}"
+
+          if [ -n "${APP_NAME}" ]; then
+            APP_SERVICE=$(kubectl get services --namespace "${CLUSTER_NAMESPACE}" -o json | jq -r ' .items[] | select (.spec.selector.app=="'"${APP_NAME}"'") | .metadata.name ')
+            echo -e "SERVICE: ${APP_SERVICE}"
+            echo "DEPLOYED SERVICES:"
+            kubectl describe services "${APP_SERVICE}" --namespace "${CLUSTER_NAMESPACE}"
+          fi
+
+          #echo "Application Logs"
+          #kubectl logs --selector app=${APP_NAME} --namespace "${CLUSTER_NAMESPACE}"
+
+          echo ""
+          if [ -n "${NOT_READY}" ]; then
+            echo ""
+            echo "=========================================================="
+            echo "DEPLOYMENT FAILED"
+            exit 1
+          fi
+
+          echo ""
+          echo "=========================================================="
+          echo "DEPLOYMENT SUCCEEDED"
+
+          if [ -n "${APP_SERVICE}" ]; then
+            echo ""
+            echo ""
+            CLUSTER_ID=${PIPELINE_KUBERNETES_CLUSTER_ID:-${PIPELINE_KUBERNETES_CLUSTER_NAME}}
+            IP_ADDR=$( ibmcloud ks workers --cluster "${CLUSTER_ID}" | grep normal | head -n 1 | awk '{ print $2 }' )
+            if [ -z "${IP_ADDR}" ]; then
+              echo -e "${PIPELINE_KUBERNETES_CLUSTER_NAME} not created or workers not ready"
+              exit 1
+            fi
+            PORT=$( kubectl get services --namespace "${CLUSTER_NAMESPACE}" | grep "${APP_SERVICE}" | sed 's/.*:\([0-9]*\).*/\1/g' )
+            APP_URL=http://${IP_ADDR}:${PORT}
+            echo -e "VIEW THE APPLICATION AT: ${APP_URL}"
+            echo -n "${APP_URL}" > "$(results.app-url.path)"
+          fi
+
+      volumeMounts:
+        - name: cd-config-volume
+          mountPath: /cd-config
+          # yamllint enable rule:line-length
+        - name: secrets
+          mountPath: /secrets
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)

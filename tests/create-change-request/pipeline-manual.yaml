@@ -1,0 +1,71 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline-manual-create-change-request
+spec:
+
+  params:
+    - name: pipeline-debug
+
+  tasks:
+
+    - name: setup
+      taskRef:
+        name: setup-create-change-request
+
+    - name: pipeline-create-cr
+      taskRef:
+        name: servicenow-create-change-request
+      runAfter:
+        - setup
+      params:
+        - name: servicenow-api-url
+          value: "https://watsontest.service-now.com/api/ibmwc/change"
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+
+        - name: registry-url
+          value: "us.icr.io"
+        - name: registry-namespace
+          value: "cocoa-dev"
+        - name: image-name
+          value: "hello-compliance-20200403132535508"
+        - name: image-tag
+          value: "20200513050447-master-bb181c06a97f2b0ffdab4ae2d27fcb404bfd083b"
+
+        - name: servicenow-planned-start
+          value: "$(tasks.setup.results.planned-start)"
+        - name: servicenow-planned-end
+          value: "$(tasks.setup.results.planned-end)"
+        - name: servicenow-configuration-item
+          value: "cocoa-sandbox"
+        - name: servicenow-assigned-to
+          value: "szabolcsit@hu.ibm.com"
+        - name: servicenow-description
+          value: "Test data for description"
+        - name: servicenow-purpose
+          value: "Test data for purpose"
+        - name: servicenow-impact
+          value: "Test data for impact"
+        - name: servicenow-backout-plan
+          value: "Test data for backout plan"
+        - name: servicenow-region-id
+          value: "ibm:ys1:us-south"
+        - name: servicenow-priority
+          value: "low"
+        - name: servicenow-outage-duration
+          value: "0 00:00:00"
+        - name: servicenow-deployment-ready
+          value: "yes"
+        - name: servicenow-type
+          value: "standard"
+
+    - name: assert
+      taskRef:
+        name: assert-create-change-request
+      runAfter:
+        - pipeline-create-cr
+      params:
+        - name: change-request-id-result
+          value: "$(tasks.pipeline-create-cr.results.change-request-id)"

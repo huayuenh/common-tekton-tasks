@@ -1,0 +1,23 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: example-pipeline
+spec:
+  params:
+    - name: app-name
+    - name: branch
+    - name: repository
+    - name: commit
+  tasks:
+    - name: publish-build
+      taskRef:
+        name: devops-insights-publish-build
+      params:
+        - name: app-name
+          value: $(params.app-name)
+        - name: git-repository
+          value: $(params.repository)
+        - name: git-branch
+          value: $(params.branch)
+        - name: git-commit
+          value: $(params.commit)

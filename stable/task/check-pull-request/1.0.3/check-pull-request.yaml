@@ -1,0 +1,171 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: check-pull-request
+  labels:
+    app.kubernetes.io/version: 1.0.3
+spec:
+  params:
+    - name: github-user
+      description: github enterprise user
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: branch
+      description: the feature branch
+    - name: target-branch
+      description: the main branch
+    - name: pr-number
+      description: the number of the pull request
+    - name: pipeline-debug
+      default: "0"
+    - name: directory-name
+    - name: to-commit
+    - name: from-commit
+    - name: repo-url
+
+  stepTemplate:
+    env:
+      - name: GH_USER
+        value: $(params.github-user)
+      - name: TARGET_BRANCH
+        value: $(params.target-branch)
+      - name: BRANCH
+        value: $(params.branch)
+      - name: PR_NUMBER
+        value: $(params.pr-number)
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: DIRECTORY_NAME
+        value: $(params.directory-name)
+
+  results:
+    - name: exit-code
+      description: The exit-code of the script
+    - name: status
+      description: The status based on exit-code
+
+  steps:
+    - name: run-pr-checker-script
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+      env:
+        - name: REPO_URL
+          value: $(params.repo-url)
+      script: |
+        #!/bin/bash
+        set +ex
+
+        if [[ "$PIPELINE_DEBUG" == 1 ]]; then
+          trap env EXIT
+          set -x
+        fi
+
+        ERROR=0
+
+        REPO_NAME=$(echo "$REPO_URL" | cut -f5 -d/)
+        REPO_ORG=$(echo "$REPO_URL" | cut -f4 -d/)
+
+        cd /artifacts/${DIRECTORY_NAME}
+        GH_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+        if  [[ $BRANCH == release* ]];
+        then
+            echo "Release branch Skipping pull request checks..."
+            exit 0
+        fi
+
+        if [[ -n $(git log $TARGET_BRANCH..HEAD^2 --oneline --merges) ]]; then
+          echo "PR should have a linear history. Please rebase your PR:"
+          echo ""
+          echo "git checkout $BRANCH"
+          echo "git pull"
+          echo "git rebase origin/$TARGET_BRANCH"
+          echo "git push --force-with-lease"
+          echo ""
+          echo "If this results in too many merge conflicts:"
+          echo ""
+          echo "git checkout $BRANCH"
+          echo "git pull"
+          echo "git reset origin/$TARGET_BRANCH"
+          echo ""
+          echo "And then commit your work again manually (don't forget to push with --force-with-lease)"
+          exit 1
+        fi
+
+        PR_BODY=$(curl -s -u "$GH_USER:$GH_TOKEN" "https://github.ibm.com/api/v3/repos/${REPO_ORG}/${REPO_NAME}/pulls/$PR_NUMBER" | jq .body)
+
+        REQUIRED_CHECKBOXES=$(grep -e "-\s\[\s]\s.*" .github/pull_request_template.md)
+        REQUIRED_CHECKBOX_COUNT=$(echo "$REQUIRED_CHECKBOXES" | wc -l)
+        CHECKED_CHECKBOX_COUNT=$(echo "$PR_BODY" | grep -oie "-\s\[x]" | wc -l)
+
+        if [[ "$CHECKED_CHECKBOX_COUNT" < "$REQUIRED_CHECKBOX_COUNT" ]]; then
+          echo "Every checkbox should be checked before merge and shouldn't be deleted! Please make sure that the requirements are satisfied."
+          echo ""
+          echo "Required checkboxes:"
+          echo "$REQUIRED_CHECKBOXES"
+          ERROR=1
+        fi
+
+        if ! ([[ "$PR_BODY" =~ cocoa/board/issues/[0-9]+ ]] || [[ "$PR_BODY" =~ cocoa/board#[0-9]+ ]]); then
+          echo "No issue reference (eg. cocoa/board#1234) was found in the PR, please make sure that you link the PR to an existing issue."
+          ERROR=1
+        fi
+
+        echo "ERROR=\"${ERROR}\"" >> /steps/step.variables
+
+    - name: run-commitlint
+      image: ibmcom/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+      env:
+        - name: TO_COMMIT
+          value: $(params.to-commit)
+        - name: FROM_COMMIT
+          value: $(params.from-commit)
+      script: |
+        #!/bin/bash
+        set +ex
+
+        export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+        if [[ "$PIPELINE_DEBUG" == 1 ]]; then
+          trap env EXIT
+          set -x
+        fi
+
+        source /steps/step.variables
+
+        cd /artifacts/${DIRECTORY_NAME}
+
+        npm install -g @commitlint/cli @commitlint/config-conventional --ignore-scripts
+
+        commitlint --from=$FROM_COMMIT --to=$TO_COMMIT
+
+        exit_code=$?
+
+        if [ $exit_code -ne 0 ]; then
+          ERROR=1
+          echo "Commit messages in the PR do not satisfy conventional commit requirements, please rename your commits!"
+        fi
+
+        echo -n $ERROR > $(results.exit-code.path)
+        if [ $ERROR -ne 0 ]; then
+          echo -n 'failure' > $(results.status.path)
+        else
+          echo -n 'success' > $(results.status.path)
+        fi
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: steps-volume
+      emptyDir: {}

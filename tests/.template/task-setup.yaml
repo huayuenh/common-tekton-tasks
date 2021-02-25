@@ -1,0 +1,21 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: setup-%TASK_NAME%
+spec:
+  params:
+    - name: task-pvc
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+
+  steps:
+    - name: setup
+      image: ibmcom/pipeline-base-image:2.6
+      command: ["/bin/bash", "-c"]
+      workingDir: "/artifacts"
+      args:
+        - |
+          set -e -o pipefail;

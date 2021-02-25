@@ -1,0 +1,205 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: devops-insights-publish-test
+  labels:
+    tekton.dev/deprecated: true
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  description: |
+    This task publishes a test record to DevOps Insights.
+  params:
+    - name: app-name
+      description: Logical application name for DevOps Insights
+    - name: toolchain-id
+      description: Toolchain service instance id - Default to the toolchain containing the CD Tekton PipelineRun currently executed
+      default: ""
+    - name: build-number
+      description: Devops Inisghts build number reference. Default to the CD Tekton Pipeline build number
+      default: ""
+    - name: file-locations
+      description: Semi-colon separated list of test result file locations
+    - name: test-types
+      description: Semi-colon separated list of test result types
+    - name: environment
+      description: Optional, The environment name to associate with the test results. This option is ignored for unit tests, code coverage tests, and static security scans.
+      default: ""
+    - name: ibmcloud-api
+      description: the ibmcloud api
+      default: https://cloud.ibm.com
+    - name: continuous-delivery-context-secret
+      description: name of the configmap containing the continuous delivery pipeline context secrets
+      default: "secure-properties"
+    - name: toolchain-apikey-secret-key
+      description: field in the secret that contains the api key used to access toolchain and DOI instance
+      default: "toolchain-apikey"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: break-glass-name
+      description: Name of the `ConfigMap` that holds Break-Glass mode settings
+      default: environment-properties
+    - name: break-glass-key
+      description: Key in the `break-glass-name` `ConfigMap` that holds the Break-Glass mode settings
+      default: break_glass
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+  workspaces:
+    - name: artifacts
+      description: A workspace containing the test results file to pubslih to DOI
+      mountPath: /artifacts
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+  steps:
+    - name: publish-testrecord
+      image: ibmcom/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      env:
+        - name: IBM_CLOUD_API
+          value: $(params.ibmcloud-api)
+        - name: IBM_CLOUD_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.toolchain-apikey-secret-key)
+              optional: true
+        - name: BREAK_GLASS
+          valueFrom:
+            configMapKeyRef:
+              name: $(params.break-glass-name)
+              key: $(params.break-glass-key)
+              optional: true
+        - name: APP_NAME
+          value: $(params.app-name)
+        - name: TOOLCHAIN_ID
+          value: $(params.toolchain-id)
+        - name: BUILD_NUMBER
+          value: $(params.build-number)
+        - name: FILE_LOCATIONS
+          value: $(params.file-locations)
+        - name: TEST_TYPES
+          value: $(params.test-types)
+        - name: DEFAULT_BUILD_NUMBER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/build-number']
+      workingDir: /artifacts
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ $PIPELINE_DEBUG == 1 ]; then
+          env
+          cat /cd-config/toolchain.json
+          trap env EXIT
+          set -x
+        fi
+
+        if [[ -n "$BREAK_GLASS" ]]; then
+          echo "Break-Glass mode is on, skipping the rest of the task..."
+          exit 0
+        fi
+
+        ##########################################################################
+        # Setting HOME explicitly to have ibmcloud plugins available
+        # doing the export rather than env definition is a workaround
+        # until https://github.com/tektoncd/pipeline/issues/1836 is fixed
+        export HOME="/root"
+        ##########################################################################
+        if [[ "$IBM_CLOUD_API" == *test* ]]; then
+          export IBM_CLOUD_DEVOPS_ENV=dev
+        fi
+
+        CURRENT_TOOLCHAIN_ID=$(jq -r '.toolchain_guid' /cd-config/toolchain.json)
+        DOI_IN_TOOLCHAIN=$(jq -e '[.services[] | select(.service_id=="draservicebroker")] | length' /cd-config/toolchain.json)
+
+        if [ "$DOI_IN_TOOLCHAIN" == 0 ]; then
+          if [ -z "$TOOLCHAIN_ID" ] || [ "$CURRENT_TOOLCHAIN_ID" == "$TOOLCHAIN_ID" ]; then
+            echo "No Devops Insights integration found in toolchain. Skipping ..."
+            exit 0
+          fi
+        fi
+
+        # Default Toolchain ID if needed
+        if [ -z "$TOOLCHAIN_ID" ]; then
+          TOOLCHAIN_ID="$CURRENT_TOOLCHAIN_ID"
+        fi
+
+        # Default Job URL if needed
+        if [ -z "$JOB_URL" ]; then
+          JOB_URL="$PIPELINE_RUN_URL"
+        fi
+
+        # Default build number if needed
+        if [ -z "$BUILD_NUMBER" ]; then
+          BUILD_NUMBER="$DEFAULT_BUILD_NUMBER"
+        fi
+
+        if [ "$(params.environment)" ]; then
+          ENVIRONMENT=" --env \"$(params.environment)\""
+        else
+          ENVIRONMENT=""
+        fi
+
+        export TOOLCHAIN_ID=${TOOLCHAIN_ID} # for doi plugin
+
+        source /scripts/retry_command.sh
+
+        retry $(params.retry-count) $(params.retry-delay) \
+          ibmcloud login --apikey ${IBM_CLOUD_API_KEY} -a ${IBM_CLOUD_API} --no-region
+
+        exit_code=$?
+
+        if [ $exit_code -ne 0 ]; then
+          echo "Error logging in with IBM_CLOUD_API_KEY"
+          exit $exit_code
+        fi
+
+        ibmcloud_publish_testrecords() {
+          IFS=';' read -ra locations <<< "$FILE_LOCATIONS"
+          IFS=';' read -ra types <<< "$TEST_TYPES"
+          for i in "${!locations[@]}"
+          do
+              echo "$i ${locations[i]} ${types[i]}"
+              ibmcloud doi publishtestrecord \
+                --logicalappname="$APP_NAME" \
+                --buildnumber=$BUILD_NUMBER \
+                --filelocation=${locations[i]} \
+                --type=${types[i]} $ENVIRONMENT
+          done
+        }
+
+        retry $(params.retry-count) $(params.retry-delay) ibmcloud_publish_testrecords
+
+        exit_code=$?
+
+        if [ $exit_code -ne 0 ]; then
+          echo "Error during the doi testrecord publish"
+          exit $exit_code
+        fi
+
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+        - name: retry-command
+          mountPath: /scripts
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

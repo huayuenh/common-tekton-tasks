@@ -1,0 +1,512 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: compliance-collector
+  labels:
+    app.kubernetes.io/version: "2.1.3"
+    tekton.dev/deprecated: true
+spec:
+  description: |
+    Task to execute multiple jobs that are all related to compliance evidence collection from a pipeline run.
+    Because of the nature of the task, it is recommended to use this near the end of the pipeline.
+
+    Jobs executed in this task:
+
+    - create incident issues on task results if needed
+    - upload task artifacts
+    - fetch and upload pipeline logs (log including everything that precedes this task)
+    - create and upload compliance evidence
+
+    Previously these were separated tekton tasks, running after each test and check, but usage shown that these jobs are always executed together, so including all these jobs in a single task makes sense, and also shortens the pipeline.
+
+    The `data` parameter is a JSON formatted array of the following objects:
+
+    ```json
+    {
+      "name": "", //task name that produced the result
+      "step": "", // step name in the task named above
+      "evidence_type": "com.ibm.test-or-task-type", // type of test or scan that will appear in compliance reports
+      "evidence_type_version": "1.0.0", // version of evidence type
+      "expected": "success", // expected result
+      "actual": "", // output from the task that produced result
+      "artifacts": [
+        "", // paths of generated artifacts, scans test results...
+      ]
+    },
+    ```
+  params:
+    - name: data
+      description: Task results from the pipeline in a JSON format, see the documentation for more details
+    - name: namespace
+      description: Pipeline namespace where the source of the evidence run ("ci or "cd")
+    - name: incident-issue-repo
+      description: The incident issue git repository
+    - name: commit-hash
+      description: The commit hash on which the current build runs
+      default: ""
+    - name: toolchain-crn
+      description: Cloud resource name of the toolchain the pipeline belongs to
+    - name: evidence-repo-url
+      description: URL to the evidence git repo
+    - name: application-repo-url
+      description: URL to the application git repo
+      default: ""
+    - name: cos-bucket-name
+      default: ""
+      description: Bucket name in your Cloud Object Storage instance, used as an Evidence Locker
+    - name: cos-endpoint
+      default: ""
+      description: Endpoint of your Cloud Object Storage instance, used as an Evidence Locker
+    - name: toolchain-apikey-secret-key
+      default: "ibmcloud-api-key"
+    - name: continuous-delivery-context-secret
+      default: "secure-properties"
+    - name: git-api-token-key
+      default: "git-token"
+    - name: skip-pipeline-logs
+      description: Skip pipeline data upload as artifact. Useful if this task is run more than once in a pipeline.
+      default: "0"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: break-glass-name
+      description: Name of the `ConfigMap` that holds Break-Glass mode settings
+      default: environment-properties
+    - name: break-glass-key
+      description: Key in the `break-glass-name` `ConfigMap` that holds the Break-Glass mode settings
+      default: break_glass
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /runtime-secrets
+
+  volumes:
+    - name: steps-volume
+      emptyDir: {}
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh
+    - name: compliance-helper-scripts
+      configMap:
+        name: compliance-helper-scripts
+        items:
+          - key: create_pipeline_task_url.sh
+            path: create_pipeline_task_url.sh
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+
+  stepTemplate:
+    env:
+      - name: COMMIT_HASH
+        value: $(params.commit-hash)
+      - name: DATA
+        value: $(params.data)
+      - name: NAMESPACE
+        value: $(params.namespace)
+      - name: ISSUE_REPO_URL
+        value: $(params.incident-issue-repo)
+      - name: EVIDENCE_REPO_URL
+        value: $(params.evidence-repo-url)
+      - name: APP_REPO_URL
+        value: $(params.application-repo-url)
+      - name: TOOLCHAIN_CRN
+        value: $(params.toolchain-crn)
+      - name: COS_BUCKET_NAME
+        value: "$(params.cos-bucket-name)"
+      - name: COS_ENDPOINT
+        value: "$(params.cos-endpoint)"
+      - name: BREAK_GLASS
+        valueFrom:
+          configMapKeyRef:
+            name: $(params.break-glass-name)
+            key: $(params.break-glass-key)
+            optional: true
+      - name: PIPELINE_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-id']
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+      - name: PIPELINE_RUN_URL
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  steps:
+
+    - name: process-and-upload
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.1.6@sha256:42db55c890a5a12322954568c801a8bdf324474744e7aa66c9b61ae8f17749f3
+      workingDir: $(workspaces.artifacts.path)
+      volumeMounts:
+        - mountPath: /scripts
+          name: retry-command
+        - mountPath: /compliance-helper-scripts
+          name: compliance-helper-scripts
+        - mountPath: /steps
+          name: steps-volume
+        - mountPath: /secrets
+          name: secrets
+      script: |
+        #!/bin/bash
+
+        set -e -o pipefail;
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        #
+        # set up helpers
+        #
+
+        source /scripts/retry_command.sh
+        TOKEN=$(cat /runtime-secrets/$(params.git-api-token-key))
+
+        EVIDENCE_REPO_NAME=${EVIDENCE_REPO_URL##*/}
+        export EVIDENCE_REPO_NAME=${EVIDENCE_REPO_NAME%.git}
+        EVIDENCE_REPO_ORG=${EVIDENCE_REPO_URL%/*}
+        export EVIDENCE_REPO_ORG=${EVIDENCE_REPO_ORG##*/}
+
+        PIPELINE_REGION=${PIPELINE_RUN_URL##*:}
+
+        ISSUE_REPO_NAME=${ISSUE_REPO_URL##*/}
+        export ISSUE_REPO_NAME=${ISSUE_REPO_NAME%.git}
+        ISSUE_REPO_ORG=${ISSUE_REPO_URL%/*}
+        export ISSUE_REPO_ORG=${ISSUE_REPO_ORG##*/}
+
+        echo "export EVIDENCE_REPO_NAME=${EVIDENCE_REPO_NAME}" >> /steps/step.variables
+        echo "export EVIDENCE_REPO_ORG=${EVIDENCE_REPO_ORG}" >> /steps/step.variables
+        echo "export GHE_TOKEN=${TOKEN}" >> /steps/step.variables
+        echo "export TOKEN=${TOKEN}" >> /steps/step.variables
+        echo "export PIPELINE_REGION=${PIPELINE_REGION}" >> /steps/step.variables
+        echo "export TOOLCHAIN_REGION=${PIPELINE_REGION}" >> /steps/step.variables
+        echo "export ISSUE_REPO_NAME=${ISSUE_REPO_NAME}" >> /steps/step.variables
+        echo "export ISSUE_REPO_ORG=${ISSUE_REPO_ORG}" >> /steps/step.variables
+
+        source /steps/step.variables
+        source /scripts/retry_command.sh
+        source /compliance-helper-scripts/create_pipeline_task_url.sh
+
+        export IBMCLOUD_API_KEY=$(cat "/secrets/$(params.toolchain-apikey-secret-key)")
+        echo "export IBMCLOUD_API_KEY=${IBMCLOUD_API_KEY}" >> /steps/step.variables
+        export COS_API_KEY="$IBMCLOUD_API_KEY"
+        echo "export COS_API_KEY=${COS_API_KEY}" >> /steps/step.variables
+
+        export BACKEND_PARAMETER="--backend=git"
+
+        if [[ \
+          "$COS_ENDPOINT" \
+          && "$COS_BUCKET_NAME" \
+          && ! ${BREAK_GLASS+x} \
+        ]]; then
+          BACKEND_PARAMETER="--backend=cos,git"
+        fi
+
+        #
+        # fetch and upload logs,
+        # if we're not in debug mode
+        # and if BREAK_GLASS mode is not set
+        #
+
+        if [[ \
+          "$PIPELINE_DEBUG" -ne 1 \
+          && ! ${BREAK_GLASS+x} \
+        ]]; then
+
+          cocoa tekton get-pipeline-logs \
+            --output-dir "$(workspaces.artifacts.path)/pipeline-logs"
+
+          for log in ./pipeline-logs/**/*
+          do
+            echo "Processing $log"
+
+            log_url=$(cocoa artifact upload \
+              $BACKEND_PARAMETER \
+              --namespace="${NAMESPACE}" \
+              --upload-path="$(echo $log | sed 's#./pipeline-logs/##')" \
+              $log)
+
+            echo "Log uploaded as $log_url"
+            log_hash=$(md5sum $log | awk '{print $1}')
+
+            echo -n $log_url > "${log/.log/.url}"
+            echo -n $log_hash > "${log/.log/.hash}"
+          done
+
+        fi
+
+        #
+        # iterate over data
+        #
+
+        for row in $(echo "${DATA}" | jq -c '.[] '); do
+
+          _jq() {
+            echo ${row} | jq -r ${1}
+          }
+
+          TASK_NAME=$(_jq '.name')
+          STEP_NAME=$(_jq '.step')
+
+          echo "Processing $TASK_NAME/$STEP_NAME ..."
+          echo ""
+
+          URL=$(create_pipeline_task_url "$PIPELINE_RUN_URL" "$TASK_NAME" "$STEP_NAME")
+
+          RESULT="failure"
+          if [ $(_jq '.expected') == $(_jq '.actual') ]; then
+            RESULT="success"
+          fi
+
+          #
+          # create incident issues
+          #
+
+          INCIDENT_ISSUE_PARAMETER=""
+
+          if [ $RESULT == "failure" ]; then
+
+            export GHE_TOKEN="$TOKEN"
+            export ISSUE_REPO_URL="$ISSUE_REPO_URL"
+
+            PARAMS=""
+
+            if [ -z "${APP_REPO_URL}" ] || [ -z "${COMMIT_HASH}" ]; then
+              PARAMS="--task=\"${TASK_NAME}\" \
+              --pipeline-run-url=\"${URL}\" \
+              --repo=\"${ISSUE_REPO_NAME}\" \
+              --org=\"${ISSUE_REPO_ORG}\""
+            else
+              PARAMS="--task=\"${TASK_NAME}\" \
+              --commit-hash=\"${COMMIT_HASH}\" \
+              --pipeline-run-url=\"${URL}\" \
+              --repo=\"${ISSUE_REPO_NAME}\" \
+              --org=\"${ISSUE_REPO_ORG}\" \
+              --app-repo-url=\"${APP_REPO_URL}\""
+            fi
+
+            ISSUE_URL=$(cocoa incident add $PARAMS)
+
+            exit_code=$?
+
+            if [ $exit_code -ne 0 ]; then
+              echo "Error creating the incident issue. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+              exit $exit_code
+            fi
+
+            echo Issue URL: $ISSUE_URL
+            INCIDENT_ISSUE_PARAMETER="--issue=$ISSUE_URL"
+          else
+            echo "No issues were created for $TASK_NAME/$STEP_NAME"
+          fi
+
+          echo ""
+
+          #
+          # upload artifacts
+          #
+
+          # TODO, now we're just displaying them to the logs
+
+          ARTIFACTS_PARAMETER=""
+          ARTIFACTS=$(_jq '.artifacts')
+
+          if [ -n "$ARTIFACTS" ]; then
+
+            for artifact_row in $(echo "${ARTIFACTS}" | jq -c '.[] '); do
+              _get_artifact() {
+                echo ${artifact_row} | jq -r ${1}
+              }
+
+              artifact=$(_get_artifact ".")
+
+              if [ -f "./$artifact" ]; then
+                echo "Uploading artifact: $artifact"
+
+                ARTIFACT_URL=$(cocoa artifact upload \
+                  $BACKEND_PARAMETER \
+                  --namespace="${NAMESPACE}" \
+                  "./$artifact")
+
+                ARTIFACT_HASH=$(md5sum "./$artifact" | awk '{print $1}')
+
+                ARTIFACTS_PARAMETER="$ARTIFACTS_PARAMETER --artifact $ARTIFACT_URL $ARTIFACT_HASH"
+
+                echo ""
+              fi
+
+            done
+
+          fi
+
+          #
+          # collect task logs
+          #
+
+          LOGS_PARAMETER=""
+
+          for log_url_file in ./pipeline-logs/$TASK_NAME/*.url
+          do
+            if [ -f "$log_url_file" ]; then
+              echo "Attaching logs of ${TASK_NAME}: ${log_url_file}"
+
+              log_hash_file="${log_url_file/.url/.hash}"
+
+              LOGS_PARAMETER="${LOGS_PARAMETER} --log=$(cat $log_url_file) $(cat $log_hash_file)"
+            fi
+          done
+
+          #
+          # create evidence
+          #
+
+          EVIDENCE_TYPE=$(_jq '.evidence_type')
+          EVIDENCE_TYPE_VERSION=$(_jq '.evidence_type_version')
+
+            cocoa evidence upload \
+              $BACKEND_PARAMETER \
+              --namespace="${NAMESPACE}" \
+              --evidence-name="${TASK_NAME}" \
+              --evidence-type="${EVIDENCE_TYPE}" \
+              --evidence-type-version="${EVIDENCE_TYPE_VERSION}" \
+              --result=${RESULT} \
+              --pipeline-run-url="$URL" \
+              $LOGS_PARAMETER \
+              $INCIDENT_ISSUE_PARAMETER \
+              $ARTIFACTS_PARAMETER
+
+          # exit_code=$?
+
+          # if [ $exit_code -ne 0 ]; then
+          #   echo "Error pushing to evidence locker repository. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+          #   exit $exit_code
+          # fi
+
+          echo ""
+
+        done
+    - name: get-pipeline-response
+      image: ibmcom/pipeline-base-image:2.9@sha256:2976e1374e87f5cddabcf80179d9708868d52dbf656fdde60f803553be633db2
+      workingDir: $(workspaces.artifacts.path)
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+      script: |
+        #!/bin/bash
+
+        if [[ -n "$BREAK_GLASS" ]]; then
+          echo "Break-Glass mode is on, skipping the rest of the task..."
+          exit 0
+        fi
+
+        if [ "$(params.skip-pipeline-logs)" == 1 ]; then
+          exit 0
+        fi
+
+        set -e -o pipefail;
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        source /steps/step.variables
+
+        IAM_URL=https://iam.cloud.ibm.com/identity/token
+
+        IAM_RESPONSE=$(curl -k -X POST \
+        --header "Content-Type: application/x-www-form-urlencoded" \
+        --header "Accept: application/json" \
+        --data-urlencode "grant_type=urn:ibm:params:oauth:grant-type:apikey" \
+        --data-urlencode "apikey=$IBMCLOUD_API_KEY" \
+        $IAM_URL)
+
+        IAM_ACCESS_TOKEN=$(echo $IAM_RESPONSE | jq -r '.access_token')
+
+        REGION=${PIPELINE_RUN_URL##*:}
+
+        curl -s -k -X GET \
+        --header "Authorization: Bearer $IAM_ACCESS_TOKEN" \
+        --header "Accept: application/json" \
+        --header "Content-Type: application/json" \
+        -o pipeline-run-data.json \
+        "https://api.${REGION}.devops.cloud.ibm.com/v1/tekton-pipelines/$PIPELINE_ID/runs/${PIPELINE_RUN_ID}"
+
+    - name: upload-pipeline-response
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.1.1@sha256:d244f8807f6f777e412d084f7c6192019664d5cfa780cc251701943c657220df
+      workingDir: $(workspaces.artifacts.path)
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+        - mountPath: /scripts
+          name: retry-command
+      script: |
+        #!/bin/bash
+
+        if [[ -n "$BREAK_GLASS" ]]; then
+          echo "Break-Glass mode is on, skipping the rest of the task..."
+          exit 0
+        fi
+
+        if [ "$(params.skip-pipeline-logs)" == 1 ]; then
+          exit 0
+        fi
+
+        set -e -o pipefail;
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        source /steps/step.variables
+        source /scripts/retry_command.sh
+        ls
+        BACKEND_PARAMETER="--backend=git"
+
+        if [[ \
+          "$COS_ENDPOINT" \
+          && "$COS_BUCKET_NAME" \
+        ]]; then
+          BACKEND_PARAMETER="--backend=cos,git"
+        fi
+
+        retry $(params.retry-count) $(params.retry-delay) \
+          cocoa artifact upload pipeline-run-data.json \
+            $BACKEND_PARAMETER \
+            --pipeline-run-id="${PIPELINE_RUN_ID}" \
+            --namespace="${NAMESPACE}"
+
+        exit_code=$?
+
+        if [ $exit_code -ne 0 ]; then
+          echo "Error pushing to evidence locker repository. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+          exit $exit_code
+        fi

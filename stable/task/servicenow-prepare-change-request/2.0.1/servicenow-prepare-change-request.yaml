@@ -1,0 +1,323 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: servicenow-prepare-change-request
+  labels:
+    app.kubernetes.io/version: "2.0.1"
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: servicenow-configuration-item
+      description: The name of the service to be deployed as it is registered in ServiceNow
+    - name: formatted-summary-path
+      description: Path to the formatted evidence summary
+      default: ""
+    - name: inventory-name
+      description: The name of the inventory entry.
+    - name: inventory-target
+      description: Target branch in the inventory repo.
+    - name: inventory-folder
+      description: The path to the inventory repository on the workspace.
+    - name: inventory-repo-name
+      description: The name of the inventory repository
+    - name: inventory-repo-owner
+      description: The owner of the inventory repository
+    - name: registry-url
+      description: The registry url part of the image
+    - name: registry-namespace
+      description: The registry name part of the image
+    - name: image-name
+      description: The name of the given image
+    - name: image-tag
+      description: The tag part of the image
+    - name: repository
+      description: The git repo of the application to be deployed
+    - name: evidence-failure-count
+      description: Number of failures in the evidence summary - if it's higher than 0, the 'deployment readiness' field in the CR will be marked as false
+      default: "0"
+    - name: cluster
+      description: The name or ID of the target production cluster.
+      default: ""
+    - name: cluster-region
+      description: The target region of production cluster.
+      default: ""
+    - name: cluster-namespace
+      description:
+      default: ""
+    - name: git-commit-from
+      description: git commit hash in the 'repository' to start reading changelog
+      default: ""
+    - name: git-commit-to
+      description: git commit hash in the 'repository' to stop reading changelog
+      default: ""
+    - name: emergency-label
+      description:
+      default: "EMERGENCY"
+    - name: change-request-id
+      description: optional ServiceNow Change Request ID
+      default: "notAvailable"
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: ibmcloud-api-key-secret-key
+      description: The IBM Cloud api key secret name
+      default: "ibmcloud-api-key"
+    - name: git-api-token-key
+      description: github enterprise api token secret name
+      default: "git-token"
+    - name: ibmcloud-api
+      description: the ibmcloud api endpoint
+      default: "https://cloud.ibm.com"
+    - name: retry-count
+      description: retry count
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  results:
+    - name: change-request-json-path
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: dynamic-secrets
+      mountPath: /dynamic-secrets
+
+  volumes:
+    - name: steps-volume
+      emptyDir: {}
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh
+
+  stepTemplate:
+    env:
+      - name: HOME
+        value: "/root"
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+      - name: IBMCLOUD_API_ENDPOINT
+        value: $(params.ibmcloud-api)
+      - name: REPOSITORY
+        value: $(params.repository)
+      - name: REGISTRY_URL
+        value: $(params.registry-url)
+      - name: REGISTRY_NAMESPACE
+        value: $(params.registry-namespace)
+      - name: IMAGE_NAME
+        value: $(params.image-name)
+      - name: IMAGE_TAG
+        value: $(params.image-tag)
+      - name: FROM
+        value: $(params.git-commit-from)
+      - name: TO
+        value: $(params.git-commit-to)
+      - name: CLUSTER_REGION
+        value: $(params.cluster-region)
+      - name: CLUSTER_NAME
+        value: $(params.cluster)
+      - name: CLUSTER_NAMESPACE
+        value: $(params.cluster-namespace)
+      - name: SERVICENOW_CONFIGURATION_ITEM
+        value: $(params.servicenow-configuration-item)
+      - name: EMERGENCY_LABEL
+        value: $(params.emergency-label)
+
+  steps:
+    - name: set-variables
+      image: ibmcom/pipeline-base-image:2.7@sha256:282677e79ccb9d20c699d384a54093894de03675752cd848a3133266c898c14c
+      workingDir: $(workspaces.artifacts.path)
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        source /scripts/retry_command.sh
+
+        export IBMCLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+        export GHE_TOKEN=$(cat "/dynamic-secrets/$(params.git-api-token-key)")
+
+        #
+        # get inventory json
+        #
+        git config --global user.email "tekton@example.com"
+        git config --global user.name "Tekton"
+
+        git clone "https://$GHE_TOKEN@github.ibm.com/cocoa/inventory-script.git"
+        PATH="$(pwd)/inventory-script:$PATH"
+        export PATH
+        cd /artifacts/"$(params.inventory-folder)"
+
+        INVENTORY_BOM=$(inventory get_json "$(params.inventory-name)" "$(params.inventory-target)")
+
+        echo "${INVENTORY_BOM}" >> /steps/inventory-bom.json
+
+        #
+        # set deployment ready status
+        #
+        DEPLOYMENT_READY="yes"
+
+        if [[ "$(params.evidence-failure-count)" -gt 0 ]]; then
+          DEPLOYMENT_READY="no"
+        fi
+
+        #
+        # set up git repo data
+        #
+        GHE_REPO=${REPOSITORY##*/}
+        GHE_REPO=${GHE_REPO%.git}
+        GHE_ORG=${REPOSITORY%/*}
+        GHE_ORG=${GHE_ORG##*/}
+        CLUSTER_REGION=$(echo "${CLUSTER_REGION}" | awk -F ":" '{print $NF}')
+
+        ibmcloud_login_and_cluster_config() {
+          ibmcloud config --check-version=false
+          ibmcloud login  -a "$IBMCLOUD_API_ENDPOINT" -r "$CLUSTER_REGION" --apikey "$IBMCLOUD_API_KEY"
+          ibmcloud ks cluster config --cluster "${CLUSTER_NAME}"
+        }
+
+        #
+        # set up data for CR
+        #
+        echo "Connecting to IBM IKS cluster"
+
+        retry $(params.retry-count) $(params.retry-delay) ibmcloud_login_and_cluster_config
+
+        SERVICENOW_REGION_ID=$(ibmcloud ks cluster get -c $CLUSTER_NAME --json | jq -j .crn | awk -F: '{print $1":"$2":"$3":"$4"::"$6"::::"}')
+        IMAGE=${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}
+
+        echo "export GHE_ORG=\"${GHE_ORG}\"" >> /steps/step.variables
+        echo "export GHE_REPO=\"${GHE_REPO}\"" >> /steps/step.variables
+        echo "export GHE_TOKEN=\"${GHE_TOKEN}\"" >> /steps/step.variables
+        echo "export IBMCLOUD_API_KEY=\"${IBMCLOUD_API_KEY}\""  >> /steps/step.variables
+        echo "export FROM=${FROM}" >> /steps/step.variables
+        echo "export TO=${TO}" >> /steps/step.variables
+        echo "export EMERGENCY_LABEL=\"${EMERGENCY_LABEL}\"" >> /steps/step.variables
+        echo "export CLUSTER_NAME=${CLUSTER_NAME}" >> /steps/step.variables
+        echo "export SERVICENOW_CONFIGURATION_ITEM=${SERVICENOW_CONFIGURATION_ITEM}" >> /steps/step.variables
+        echo "export IMAGE=\"${IMAGE}\"" >> /steps/step.variables
+        echo "export SERVICENOW_REGION_ID=\"${SERVICENOW_REGION_ID}\"" >> /steps/step.variables
+        echo "export SERVICENOW_DEPLOYMENT_READY=\"${DEPLOYMENT_READY}\"" >> /steps/step.variables
+
+        echo "export PLANNED_START=\"$(date --utc -d 'today + 1 min' '+%F %T')\"" >> /steps/step.variables
+        echo "export PLANNED_END=\"$(date --utc -d 'today + 30 min' '+%F %T')\"" >> /steps/step.variables
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          cat /steps/step.variables
+        fi;
+
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+        - name: secrets
+          mountPath: /secrets
+        - mountPath: /scripts
+          name: retry-command
+
+    - name: prepare-cr
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/ibm-compliance-automation:1.0.3@sha256:6acbd2908813ddb3ab3cd9a77ead61fd2fa69c66d437c571ec7ffc3ebb426196
+      env:
+        - name: HOME
+          value: "/root"
+        - name: CHANGE_REQUEST_ID
+          value: $(params.change-request-id)
+      workingDir: $(workspaces.artifacts.path)
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ "$PIPELINE_DEBUG" == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        source /steps/step.variables
+
+        CHANGELOG=""
+        SUMMARY=""
+
+        if [ -z "$FROM" ] && [ -n "$TO" ]; then
+          CHANGELOG="This is the first deployment of image: ${IMAGE_NAME}:${IMAGE_TAG} on environment $SERVICENOW_REGION_ID."
+        elif [ -n "$FROM" ] && [ -n "$TO" ] && [ "$FROM" == "$TO" ]; then
+          CHANGELOG="${IMAGE_NAME}:${IMAGE_TAG} is already deployed, there are no changes from it. Same image is going to be redeployed."
+        elif [ -n "$FROM" ] && [ -n "$TO" ] && [ "$FROM" != "$TO" ]; then
+          CHANGELOG=$(cocoa changelog \
+            --org="$GHE_ORG" \
+            --repo="$GHE_REPO" \
+            --from="$FROM" \
+            --to="$TO")
+        fi
+
+        if [ "$(params.formatted-summary-path)" ]; then
+          SUMMARY=$(cat "$(params.formatted-summary-path)")
+        fi
+
+        echo "${CHANGELOG}" >> /steps/changelog.txt
+        echo "${SUMMARY}" >> /steps/summary.txt
+
+        export GHE_ORG="$(params.inventory-repo-owner)"
+        export GHE_REPO="$(params.inventory-repo-name)"
+        echo -n $(cocoa change-request prepare \
+          --emergency-label="$(params.emergency-label)" \
+          --outage-duration="0 00:00:00" \
+          --planned-start="$PLANNED_START" \
+          --planned-end="$PLANNED_END" \
+          --environment="$SERVICENOW_REGION_ID" \
+          --system=\"${SERVICENOW_CONFIGURATION_ITEM}\" \
+          --deployment-ready="$SERVICENOW_DEPLOYMENT_READY" \
+          --branch="prod_candidate") >> /steps/cr.json
+
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+
+    - name: save-cr-json
+      image: ibmcom/pipeline-base-image:2.7@sha256:282677e79ccb9d20c699d384a54093894de03675752cd848a3133266c898c14c
+      volumeMounts:
+        - mountPath: /steps
+          name: steps-volume
+      script: |
+        #!/bin/bash
+
+        if [ $PIPELINE_DEBUG = 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        CHANGELOG="$(cat /steps/changelog.txt)"
+        SUMMARY="$(cat /steps/summary.txt)"
+        INVENTORY_BOM="$(cat /steps/inventory-bom.json)"
+
+        cr="$(jq \
+          --arg changelog "$CHANGELOG" \
+          --arg summary "$SUMMARY" \
+          --arg inventory_bom "$INVENTORY_BOM" \
+          '.description = "\(.description) \n\n\($changelog) \n\nEVIDENCE SUMMARY \n\n\($summary) \n\nINVENTORY BOM \n\n\($inventory_bom)"' \
+          /steps/cr.json \
+        )" && \
+        echo "${cr}" > /artifacts/change-request.json
+
+        cat /artifacts/change-request.json
+
+        echo -n "change-request.json" > $(results.change-request-json-path.path)

@@ -1,0 +1,73 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: gitsecure-bom-check
+spec:
+  params:
+    - name: repository
+      description: the git repo
+    - name: revision
+      description: the revision
+      default: master
+    - name: commit-id
+      description: git commit id
+    - name: pr-url
+      description: pull request html url
+      default: ""
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: target-branch
+      description: target branch
+      default: "master"
+    - name: project-id
+      description: for gitlab repository, specify project-id
+      default: ""
+    - name: git-api-token-key
+      description: The name of the secret in the workspace
+      default: "git-token"
+  results:
+    - name: status
+      description: status of gitsecure bom task, possible value are-success|failure
+    - name: evidence-store
+      description: filepath to store bom task evidence
+  stepTemplate:
+    env:
+      - name: PIPELINE_RUN_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+  steps:
+    - name: bom
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/gitsecure/bom-task:2.0.0
+      imagePullPolicy: Always
+      workingDir: "/artifacts"
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          #!/bin/sh
+
+          /gitsecure/bom-task \
+            -giturl "$(params.repository)" \
+            -gitbranch "$(params.revision)" \
+            -rigserviceapi https://apiservice-dal.gitsecureapi.com \
+            -runid "$PIPELINE_RUN_ID" \
+            -commitid "$(params.commit-id)" \
+            -results_status "$(results.status.path)" \
+            -results_evidence "./gitsecure-bom-results.json" \
+            -comment_md "./gitsecure-bom-comment.md"
+
+          echo -n "gitsecure-bom-results.json" > $(results.evidence-store.path)
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)

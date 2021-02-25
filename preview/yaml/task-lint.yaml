@@ -1,0 +1,182 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: yaml-lint
+  documentation: https://github.ibm.com/one-pipeline/common-tekton-tasks/yaml/README.md
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: path
+      description: path to YAML or directory containing YAMLS to scan
+      default: "/artifacts"
+    - name: rules
+      description: custom rules file to apply to the linter or use the default "relaxed" rule set
+      default: ""
+    - name: flags
+      description: add optional flags to yamllint
+      default: ""
+    - name: fail_task
+      description: true or false, Fail task on linting failure
+      default: "false"
+    - name: strict-mode
+      description: use the --strict flag
+      default: "true"
+    - name: statuses_url
+      description: set the github statues url to enable git status updates
+      default: ""
+    - name: statuses_target_url
+      description: set the github target url for the status
+      default: "https://cloud.ibm.com/devops/"
+    - name: status_context
+      description: customise github status context
+      default: "Tekton YAML Lint"
+    - name: status_pending_description
+      description: customise github status pending description
+      default: "Tekton running YAML Lint..."
+    - name: status_success_description
+      description: customise github status success description
+      default: "YAML Lint Passed"
+    - name: status_fail_description
+      description: customise github status failed description
+      default: "Tekton Failed YAML Lint..."
+    - name: gitUser
+      description: Github user for the clone
+      default: ""
+    - name: gitPassword
+      description: Github password for the clone
+      default: ""
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  results:
+    - name: exit-code
+      description: The exit-code of the script
+    - name: status
+      description: The status based on exit-code
+
+  steps:
+    - name: lint
+      image: python:3.8.1-alpine3.11
+      workingDir: "/artifacts"
+      env:
+        - name: GIT_USER
+          value: $(params.gitUser)
+        - name: GIT_PASSWORD
+          value: $(params.gitPassword)
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          #!/bin/sh
+
+          if [ $PIPELINE_DEBUG == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          STRICT_MODE=""
+
+          if [ "$(params.strict-mode)" == "true" ]; then
+            STRICT_MODE="--strict"
+          fi
+
+          export $STRICT_MODE
+
+          pip install yamllint
+
+          if [[ "$(params.statuses_url)" != "" ]]; then
+            if [[ "${GIT_USER}" == "" ]]; then
+              CREDS="/artifacts/credentials/cred.json"
+              GIT_USER=$(cat ${CREDS} | python -c 'import json,sys;print(json.load(sys.stdin)["GIT_AUTH_USER"])')
+              GIT_PASSWORD=$(cat ${CREDS} | python -c 'import json,sys;print(json.load(sys.stdin)["GIT_TOKEN"])')
+            fi
+            if [[ "${GIT_USER}" == "" || "${GIT_PASSWORD}" == "" ]]; then
+              echo "ERROR: Status URL Provided but Users and Password not"
+              echo "Exiting failed!!!"
+              set -e
+              exit 1
+            fi
+            apk add curl
+            curl -s -o /dev/null --max-time 60 -X POST \
+                 -u ${GIT_USER}:${GIT_PASSWORD} \
+                 -H "Content-Type: application/json" \
+                 -d '{"state": "pending",
+                    "target_url": "$(params.statuses_target_url)",
+                    "description": "$(params.status_pending_description)",
+                    "context": "$(params.status_context)"}' \
+                  $(params.statuses_url)
+          fi
+          if [[ "$(params.rules)" == "" ]]; then
+            echo "Running linter..."
+            yamllint $STRICT_MODE $(params.flags) $(params.path)
+            LINT_FAIL=$?
+          elif [[ "$(params.rules)" == "relaxed" ]]; then
+            echo "Running linter..."
+            yamllint $STRICT_MODE $(params.flags) -d relaxed $(params.path)
+            LINT_FAIL=$?
+          else
+            if test -f "$(params.rules)"; then
+              cp $(params.rules) .yamllint.yaml
+            else
+              RULES=$(find . -name "$(params.rules)")
+              if test -f "${RULES}"; then
+                cp ${RULES} .yamllint.yaml
+              else
+                echo "ERROR: Rules file: $(params.rules) not found"
+                echo "Exiting failed!!!"
+                set -e
+                exit 1
+              fi
+            fi
+            echo "Using Rules:"
+            cat .yamllint.yaml
+            echo "Running linter..."
+            yamllint $STRICT_MODE $(params.flags) $(params.path)
+            LINT_FAIL=$?
+          fi
+          if [[ $LINT_FAIL == 0 ]]; then
+            echo "YAML Lint Complete, No Errors Found!"
+            echo $LINT_FAIL | tee $(results.exit-code.path)
+            echo -n success | tee $(results.status.path)
+            if [[ "$(params.statuses_url)" != "" ]]; then
+              curl -s -o /dev/null --max-time 60 -X POST \
+                -u ${GIT_USER}:${GIT_PASSWORD} \
+                -H "Content-Type: application/json" \
+                -d '{"state": "success",
+                     "target_url": "$(params.statuses_target_url)",
+                     "description": "$(params.status_success_description)",
+                     "context": "$(params.status_context)"}' \
+                $(params.statuses_url)
+            fi
+          else
+            echo $LINT_FAIL | tee $(results.exit-code.path)
+            echo -n failure | tee $(results.status.path)
+            if [[ "$(params.statuses_url)" != "" ]]; then
+              curl -s -o /dev/null --max-time 60 -X POST \
+                -u ${GIT_USER}:${GIT_PASSWORD} \
+                -H "Content-Type: application/json" \
+                -d '{"state": "failure",
+                     "target_url": "$(params.statuses_target_url)",
+                     "description": "$(params.status_fail_description)",
+                     "context": "$(params.status_context)"}' \
+                $(params.statuses_url)
+            fi
+            if [[ "$(params.fail_task)" == "true" ]]; then
+                echo "Exiting failed!!!"
+                set -e
+                exit $LINT_FAIL
+            fi
+          fi
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts

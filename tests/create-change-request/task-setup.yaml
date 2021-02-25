@@ -1,0 +1,36 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: setup-create-change-request
+spec:
+  params:
+    - name: pipeline-debug
+      default: "0"
+
+  results:
+    - name: planned-start
+    - name: planned-end
+    - name: change-request-id
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+  steps:
+    - name: setup
+      image: ibmcom/pipeline-base-image:2.6
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e -o pipefail;
+
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          echo -n $(date -d "+1 minute" +"%Y-%m-%d %H:%M:%S") > $(results.planned-start.path)
+          echo -n $(date -d "+30 minutes" +"%Y-%m-%d %H:%M:%S") > $(results.planned-end.path)

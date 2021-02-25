@@ -1,0 +1,29 @@
+{
+  "name": "common-tekton-tasks",
+  "version": "1.0.0",
+  "description": "This repository is an incubator for common Tekton Task resources, which are designed to be reusable in many pipelines.",
+  "main": ".tekton/toolchain.yml",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "lint": "yamllint -c yamllint-rules.yaml preview stable template .tekton tests",
+    "postinstall": "pip install --user yamllint || brew install yamllint"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.ibm.com/one-pipeline/common-tekton-tasks.git"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^8.3.5",
+    "@commitlint/config-conventional": "^8.3.4",
+    "husky": "^3.1.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "IBM",
+  "husky": {
+    "hooks": {
+      "pre-commit": "npm run lint",
+      "commit-msg": "commitlint -E HUSKY_GIT_PARAMS"
+    }
+  }
+}

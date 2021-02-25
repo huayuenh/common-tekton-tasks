@@ -1,0 +1,57 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: util-run
+spec:
+  params:
+    - name: image-name
+      description: The name of the image here the script is executed
+      default: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+    - name: script
+      description: The script to execute
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+  results:
+    - name: exit-code
+      description: The exit-code of the script
+    - name: status
+      description: The status based on exit-code
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+  steps:
+    - name: run-script
+      image: $(params.image-name)
+      script: |
+        #!/bin/bash
+
+        if [ $PIPELINE_DEBUG == 1 ]; then
+          pwd
+          env
+          trap env EXIT
+          set -x
+        fi
+
+        cat > /scripts/script.sh <<SCRIPT_DEF
+          $(params.script)
+        SCRIPT_DEF
+
+        chmod +x /scripts/script.sh
+
+        /scripts/script.sh
+
+        echo -n $? | tee $(results.exit-code.path)
+        EXIT=$(cat $(results.exit-code.path))
+
+        if [ $EXIT -eq 0 ]; then
+          echo -n success | tee $(results.status.path)
+        else
+          echo -n failure | tee $(results.status.path)
+        fi
+
+  workspaces:
+    - name: scripts
+      mountPath: /scripts

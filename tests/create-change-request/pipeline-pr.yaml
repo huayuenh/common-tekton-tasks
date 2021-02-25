@@ -1,0 +1,56 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline-pr-create-change-request
+spec:
+
+  params:
+    - name: pipeline-debug
+
+  tasks:
+
+    - name: setup
+      taskRef:
+        name: setup-create-change-request
+
+    - name: pipeline-create-cr
+      taskRef:
+        name: servicenow-create-change-request
+      runAfter:
+        - setup
+      params:
+        - name: servicenow-api-url
+          value: "https://watsontest.service-now.com/api/ibmwc/change"
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+
+        - name: registry-url
+          value: "us.icr.io"
+        - name: registry-namespace
+          value: "cocoa-dev"
+        - name: image-name
+          value: "hello-compliance-20200403132535508"
+        - name: image-tag
+          value: "20200513050447-master-bb181c06a97f2b0ffdab4ae2d27fcb404bfd083b"
+
+        - name: servicenow-configuration-item
+          value: "cocoa-sandbox"
+
+        - name: cluster
+          value: cocoa-dev
+        - name: cluster-region
+          value: us-south
+        - name: cluster-namespace
+          value: default
+        - name: application
+          value: hello-compliance-app
+
+    - name: assert
+      taskRef:
+        name: assert-create-change-request
+      runAfter:
+        - pipeline-create-cr
+      params:
+        - name: change-request-id-result
+          value: "$(tasks.pipeline-create-cr.results.change-request-id)"

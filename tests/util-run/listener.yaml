@@ -1,0 +1,11 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: listener-util-run
+spec:
+  triggers:
+    - binding:
+        name: binding-util-run
+      template:
+        name: template-util-run

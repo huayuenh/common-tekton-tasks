@@ -1,0 +1,39 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline-get-git-credentials
+spec:
+  params:
+    - name: repository
+      description: the git repo
+
+  workspaces:
+    - name: artifacts
+
+  tasks:
+    - name: get-git-credentials
+      taskRef:
+        name: git-get-credentials
+      workspaces:
+        - name: artifacts
+          workspace: artifacts
+      params:
+        - name: repository
+          value: $(params.repository)
+
+    - name: assert
+      taskRef:
+        name: assert-test-get-git-credentials
+      runAfter:
+        - get-git-credentials
+      workspaces:
+        - name: artifacts
+          workspace: artifacts
+      params:
+        - name: repository
+          value: $(tasks.get-git-credentials.results.repository)
+        - name: git-auth-user
+          value: $(tasks.get-git-credentials.results.git-auth-user)
+        - name: repo-name
+          value: $(tasks.get-git-credentials.results.repo-name)

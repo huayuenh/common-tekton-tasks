@@ -1,0 +1,268 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: static-code-scan-asoc
+  documentation: https://github.ibm.com/one-pipeline/common-tekton-tasks/preview/static-code-scan/README.md
+spec:
+  params:
+    - name: appscan-scan-name
+      description: ASoC application scan name
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: secure-properties
+    - name: appscan-key-secret-secret-key
+      description: ASoC secret key
+      default: appscan-key-secret
+    - name: appscan-key-id-secret-key
+      description: ASoC key id
+      default: appscan-key-id
+    - name: app-directory
+      description: Application directory
+    - name: scan-minutes-limit
+      description: The scans limit in minutes (positive integer)
+      default: "10"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  results:
+    - name: extracted-issues
+      description: Path of the extracted issues in JSON format
+    - name: exit-code
+      description: The exit-code of the script
+    - name: status
+      description: The status based on exit-code
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+
+  steps:
+    - name: static-code-scan
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      workingDir: /artifacts
+      resources:
+        limits:
+          memory: "4Gi"
+          cpu: "1"
+        requests:
+          memory: "4Gi"
+          cpu: "1"
+      env:
+        - name: APPSCAN_SCAN_NAME
+          value: $(params.appscan-scan-name)
+        - name: APP_DIRECTORY
+          value: $(params.app-directory)
+        - name: SCAN_MINUTES_LIMIT
+          value: $(params.scan-minutes-limit)
+        - name: APPSCAN_KEY_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.appscan-key-secret-secret-key)
+        - name: APPSCAN_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.appscan-key-id-secret-key)
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          #!/bin/bash
+
+          set +ex
+
+          . /root/.nvm/nvm.sh
+
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          if [[ -z "$APPSCAN_SCAN_NAME" ]]; then
+            echo "Application name cannot be empty"
+            exit 1
+          fi
+
+          if [[ -z "$APPSCAN_KEY_SECRET" ]]; then
+            echo "APPSCAN_KEY_SECRET is empty, but it's required"
+            exit 1
+          fi
+
+          if [[ -z "$APPSCAN_KEY_ID" ]]; then
+            echo "APPSCAN_KEY_ID is empty, but it's required"
+            exit 1
+          fi
+
+          if [ ! "$SCAN_MINUTES_LIMIT" -eq "$SCAN_MINUTES_LIMIT" -o "$SCAN_MINUTES_LIMIT" -le 0 ]; then
+            echo "The given SCAN_MINUTES_LIMIT variable ($SCAN_MINUTES_LIMIT) is not a number or a non-positve number, please add a positive integer"
+            exit 1
+          fi
+
+          echo "Downloading ASoC static code scanner utility..."
+
+          pushd ..
+          wget https://cloud.appscan.com/api/SCX/StaticAnalyzer/SAClientUtil?os=linux -O SAClientUtil.zip -o /dev/null
+          unzip -o -qq SAClientUtil.zip
+          echo "-Xmx4g" > "$(ls -d SAClientUtil*/)"/config/cli.config
+          chmod -R 777 ./SAClientUtil*
+          export PATH=/$(ls -d SAClientUtil*/)bin:$PATH
+          export LD_LIBRARY_PATH=/$(ls -d SAClientUtil*/)bin
+          popd
+
+          ulimit -n 10000
+
+          if [ ! -d  "/artifacts/$APP_DIRECTORY" ]; then
+            echo "Application folder cannot be found in path /artifacts/${APP_DIRECTORY}"
+            exit 1
+          fi
+
+          cd "/artifacts/$APP_DIRECTORY"
+
+          echo "Running ASoC static code scanner..."
+
+          appscan.sh version
+
+          echo "Logging in with credentials..."
+
+          login_success=$(appscan.sh api_login -P "$APPSCAN_KEY_SECRET" -u "$APPSCAN_KEY_ID" -persist)
+
+          if [ "$login_success" != "Authenticated successfully." ]; then
+            echo "Cannot authenticate with credentails..."
+          fi
+
+          APPS=($(appscan.sh list_apps | sed --regexp-extended 's/(\[|\])//g'))
+          for i in "${!APPS[@]}"; do
+            if [ "${APPS[i]}" == "$APPSCAN_SCAN_NAME" ]; then
+              export APPSCAN_APP_ID="${APPS[i+1]}"
+              break;
+            fi
+          done
+
+          if [ -z "$APPSCAN_APP_ID" ]; then
+            echo "Your application called $APPSCAN_SCAN_NAME is not in the application list"
+            echo "Please follow this process https://help.hcltechsw.com/appscan/ASoC/ASoC_Workflow.html and create an application with the given name"
+            exit 1
+          fi
+
+          APPSCAN_URL=http://ui.appscan.ibmcloud.com/AsoCUI/serviceui/main/myapps/oneapp/$APPSCAN_APP_ID/scans
+
+          echo "Generating IRX file..."
+          attempt=0
+          prepare_status=1
+
+          while [ $attempt -ne 3 ]; do
+            appscan.sh prepare -v -X -n $APPSCAN_SCAN_NAME
+            prepare_status=$?
+            if [ $prepare_status -eq 0 ]; then
+              break
+            fi
+            attempt=$(($attempt+1))
+          done
+
+          if [ $prepare_status -ne 0 ]; then
+            echo "Error when generating irx file"
+            exit 1
+          fi
+
+          echo "Enqueuing analysis..."
+
+          job_id=$(appscan.sh queue_analysis -a $APPSCAN_APP_ID -f "$APPSCAN_SCAN_NAME.irx" -n $APPSCAN_SCAN_NAME | grep -v %)
+
+          analisis_attempt=0
+
+          while [ $analisis_attempt -lt "$SCAN_MINUTES_LIMIT" ]; do
+              status=$(appscan.sh status -i $job_id)
+              case $status in
+              FinishedRunning | FinishedRunningWithErrors | Ready | ReadyIncomplete | FailedToScan | ManuallyStopped | None | MissingConfiguration | PossibleMissingConfiguration)
+                  appscan.sh get_result -i $job_id -d "$APPSCAN_SCAN_NAME.zip" -t zip
+                  unzip "$APPSCAN_SCAN_NAME.zip" -d "$APPSCAN_SCAN_NAME"
+                  break
+                  ;;
+              esac
+              sleep 60
+              analisis_attempt=$(($analisis_attempt+1))
+              echo "The analisis took $analisis_attempt minutes from limit: $SCAN_MINUTES_LIMIT"
+          done
+
+          if [ ! -d "$APPSCAN_SCAN_NAME" ]; then
+            echo "Cannot read the results in folder $APPSCAN_SCAN_NAME"
+            exit 1
+          fi
+
+          if [[ ! -f "$APPSCAN_SCAN_NAME/Report.xml" ]]; then
+            echo "Cannot read the result file ($APPSCAN_SCAN_NAME/Report.xml)"
+            exit 1
+          fi
+
+          echo "AppScan On Cloud static code scan analisis complete you can find the results at https://cloud.appscan.com/AsoCUI/serviceui/main/myapps/oneapp/$APPSCAN_APP_ID/scans"
+
+    - name: extract-found-issues
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      workingDir: "/artifacts/$(params.app-directory)"
+      env:
+        - name: APPSCAN_SCAN_NAME
+          value: $(params.appscan-scan-name)
+        - name: APP_DIR
+          value: $(params.app-directory)
+      script: |
+        #!/usr/bin/env python3
+        import xml.etree.ElementTree as ET
+        import json
+        import os
+
+        appscan_scan_name = os.environ['APPSCAN_SCAN_NAME']
+        app_dir = os.environ['APP_DIR']
+
+        path_to_xml_final = os.path.join('/','artifacts', app_dir, appscan_scan_name, 'Report-final.xml')
+        issues = []
+
+        tree = ET.parse(path_to_xml_final)
+        try:
+          for issue_group in tree.getroot().find('issue-group'):
+              issue_meta = dict()
+              issue_meta = issue_group.attrib
+              issues.append(
+                  {
+                      'meta': issue_meta,
+                      'severity': issue_group.find('severity').text,
+                      'type': issue_group.find('issue-type').find('ref').text
+                  }
+              )
+        except:
+          print("no issues were found")
+
+        with open('static_code_scan_results.json', 'w+') as results:
+          json.dump(issues, results)
+
+        with open('$(results.extracted-issues.path)', 'w+') as result_path:
+          result_path.write(os.path.join(os.getcwd(), 'static_code_scan_results.json'))
+    - name: evaluate-static-code-scan-results
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6
+      workingDir: "/artifacts/$(params.app-directory)"
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e -o pipefail
+          if [ $PIPELINE_DEBUG == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+          cat /artifacts/$(params.app-directory)/static_code_scan_results.json
+          found_issues=$(cat /artifacts/$(params.app-directory)/static_code_scan_results.json | jq -r 'length')
+          if [[ $found_issues -eq 0 ]]; then
+            echo 0 | tee $(results.exit-code.path)
+            echo -n "success" > $(results.status.path)
+          else
+            echo -n "failure" > $(results.status.path)
+            echo 1 | tee $(results.exit-code.path)
+          fi

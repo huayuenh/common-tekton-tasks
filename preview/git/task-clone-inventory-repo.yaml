@@ -1,0 +1,145 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: git-clone-inventory-repo
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: app-name
+      description: App name to look for in inventory
+    - name: git-auth-user
+      description: Authentication method of git
+    - name: git-api-token-key
+      description: The name of the secret in the workspace
+      default: "git-token"
+    - name: retry-count
+      description: retry count to get inventory
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "5"
+
+  results:
+    - name: registry-url
+      description: the image registry url
+    - name: registry-namespace
+      description: the image registry namespace
+    - name: image-name
+      description: the built docker image name
+    - name: image-tag
+      description: the docker image tag, containing the commit hash
+    - name: inventory-folder
+      description: the name of the folder on the pvc, where the inventory repo was cloned to
+    - name: app-name
+      description: the name of the application
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  steps:
+    - name: clone
+      image: ibmcom/pipeline-base-image:2.6
+      env:
+        - name: APPLICATION
+          value: $(params.app-name)
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          #!/bin/bash
+          set -e -o pipefail;
+
+          if [ "$PIPELINE_DEBUG" == 1 ]; then
+            env
+            cat /cd-config/toolchain.json
+            trap env EXIT
+            set -x
+          fi
+
+          GIT_AUTH_USER=$(params.git-auth-user)
+          GIT_TOKEN=$(cat "/secrets/$(params.git-api-token-key)")
+
+          INVENTORY_REPO=$(jq -r '.services[] | select(.toolchain_binding.name=="inventory-repo")
+          | .parameters.owner_id + "/" + .parameters.repo_name' /cd-config/toolchain.json)
+
+          INVENTORY_FOLDER=$(jq -r '.services[] | select(.toolchain_binding.name=="inventory-repo")
+          | .parameters.repo_name' /cd-config/toolchain.json)
+
+          git config --global user.email "tekton@example.com"
+          git config --global user.name "Tekton"
+
+          clone_inventory_script() {
+            git clone "https://$GIT_AUTH_USER:$GIT_TOKEN@github.ibm.com/cocoa/inventory-script.git"
+            export PATH="$(pwd)/inventory-script:$PATH"
+          }
+
+          clone_inventory_repo() {
+            cd /artifacts
+            echo "inventory repo url: $INVENTORY_REPO"
+            git clone "https://$GIT_AUTH_USER:$GIT_TOKEN@github.ibm.com/$INVENTORY_REPO.git"
+            cd "$INVENTORY_FOLDER"
+          }
+
+          source /scripts/retry_command.sh
+
+          retry $(params.retry-count) $(params.retry-delay) clone_inventory_script
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error cloning the inventory script repository. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+            exit $exit_code
+          fi
+
+          retry $(params.retry-count) $(params.retry-delay) clone_inventory_repo
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error cloning the inventory repository. There might be a github downtime, you can check it here: https://ibmtoolbox.statuspage.io"
+            exit $exit_code
+          fi
+
+          IMAGE=$(inventory get "$APPLICATION" prod_candidate)
+
+          REGISTRY_URL=$(echo "$IMAGE" | cut -f1 -d/)
+          REGISTRY_NAMESPACE=$(echo "$IMAGE" | cut -f2 -d/)
+          IMAGE_NAME=$(echo "$IMAGE" | cut -f1 -d: | cut -f3 -d/)
+          IMAGE_TAG=$(echo "$IMAGE" | cut -f2 -d:)
+
+          echo -n "$REGISTRY_URL" > $(results.registry-url.path)
+          echo -n "$REGISTRY_NAMESPACE" > $(results.registry-namespace.path)
+          echo -n "$IMAGE_NAME" > $(results.image-name.path)
+          echo -n "$IMAGE_TAG" > $(results.image-tag.path)
+          echo -n "$INVENTORY_FOLDER" > $(results.inventory-folder.path)
+          echo -n "$APPLICATION" > $(results.app-name.path)
+
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+        - mountPath: /scripts
+          name: retry-command
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+    - name: secrets
+      mountPath: /secrets
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

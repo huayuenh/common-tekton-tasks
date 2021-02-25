@@ -1,0 +1,238 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: dct-apply-image-enforcement-policy
+spec:
+  params:
+    - name: app-name
+      description: The name of your app
+    - name: validation-signer
+      description: validation signer
+    - name: registry-namespace
+      description: The registry namespace
+    - name: registry-region
+      description: the registry region
+    - name: vault-name
+      description: the key protect instance name
+    - name: resource-group
+      description: the resource group
+    - name: cluster-name
+      description: the name of the targeted cluster
+    - name: region
+      description: target region
+    - name: working-dir
+      default: "/root"
+    - name: mount-path
+      description: mount path directory
+      default: /artifacts
+    - name: helm-version
+      description: specific helm version
+      default: 2.16.1
+    - name: continuous-delivery-context-secret
+      description: Reference name for the secret resource
+      default: "secure-properties"
+    - name: ibmcloud-api-key-secret-key
+      description: The IBM Cloud api key secret name
+      default: "ibmcloud-api-key"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "10"
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  steps:
+    - name: apply-image-enforcement-policy
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      env:
+        - name: HOME
+          value: $(params.working-dir)
+        - name: REGISTRY_NAMESPACE
+          value: $(params.registry-namespace)
+        - name: VAULT_INSTANCE
+          value: $(params.vault-name)
+        - name: VALIDATION_SIGNER
+          value: $(params.validation-signer)
+        - name: IBMCLOUD_TARGET_RESOURCE_GROUP
+          value: $(params.resource-group)
+        - name: REGISTRY_REGION
+          value: $(params.registry-region)
+        - name: IBMCLOUD_TARGET_REGION
+          value: $(params.region)
+        - name: BUILD_CLUSTER
+          value: $(params.cluster-name)
+        - name: ARCHIVE_DIR
+          value: $(params.mount-path)
+        - name: IMAGE_NAME
+          value: $(params.app-name)
+        - name: CLUSTER_NAMESPACE
+          value: "prod"
+        - name: DEFAULT_HELM_VERSION
+          value: $(params.helm-version)
+        - name: ARTIFACTS
+          value: $(params.mount-path)
+      command: ["/bin/bash", "-c"]
+      workingDir: /artifacts
+      # yamllint disable rule:line-length
+      args:
+        - |
+          set -e -o pipefail
+          if [[ $PIPELINE_DEBUG == 1 ]]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          source /scripts/retry_command.sh
+
+          IBM_CLOUD_API_KEY=$(cat "/secrets/$(params.ibmcloud-api-key-secret-key)")
+
+          source /scripts/retry_command.sh
+
+          echo "LOG IN"
+
+          ibmcloud_login() {
+            ibmcloud login --apikey "$IBM_CLOUD_API_KEY" -r "$IBMCLOUD_TARGET_REGION"
+            ibmcloud target -g "$IBMCLOUD_TARGET_RESOURCE_GROUP"
+          }
+
+          retry $(params.retry-count) $(params.retry-delay) ibmcloud_login
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Cannot login to ibmcloud"
+            exit $exit_code
+          fi
+
+          cluster_config() {
+            $(ibmcloud ks cluster config --cluster "${BUILD_CLUSTER}" --export)
+            if ! kubectl get namespace "$CLUSTER_NAMESPACE"; then
+              echo "creating namespace"
+              kubectl create namespace "$CLUSTER_NAMESPACE"
+            fi
+          }
+
+          retry $(params.retry-count) $(params.retry-delay) cluster_config
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Cannot setup kubeclt for cluster"
+            exit $exit_code
+          fi
+
+          echo "CHECKING HELM VERSION: matching Helm Tiller (server) if detected. "
+          set +e
+          LOCAL_VERSION=$(helm version --client | grep SemVer: | sed "s/^.*SemVer:\"v\([0-9.]*\).*/\1/")
+          TILLER_VERSION=$(helm version --server | grep SemVer: | sed "s/^.*SemVer:\"v\([0-9.]*\).*/\1/")
+          set -e
+          if [ -z "${TILLER_VERSION}" ]; then
+            if [ -z "${DEFAULT_HELM_VERSION}" ]; then
+              CLIENT_VERSION=${DEFAULT_HELM_VERSION}
+            else
+              CLIENT_VERSION=${LOCAL_VERSION}
+            fi
+          else
+            echo -e "Helm Tiller ${TILLER_VERSION} already installed in cluster. Keeping it, and aligning client."
+            CLIENT_VERSION=${TILLER_VERSION}
+          fi
+          if [ "${CLIENT_VERSION}" != "${LOCAL_VERSION}" ]; then
+            echo -e "Installing Helm client ${CLIENT_VERSION}"
+            WORKING_DIR=$(pwd)
+            mkdir ~/tmpbin && cd ~/tmpbin
+            curl -L https://storage.googleapis.com/kubernetes-helm/helm-v${CLIENT_VERSION}-linux-amd64.tar.gz -o helm.tar.gz && tar -xzvf helm.tar.gz
+            cd linux-amd64
+            export PATH=$(pwd):$PATH
+            cd $WORKING_DIR
+          fi
+          set +e
+          if [ -z "${TILLER_VERSION}" ]; then
+            echo -e "Installing Helm Tiller ${CLIENT_VERSION} with cluster admin privileges (RBAC)"
+            kubectl -n kube-system create serviceaccount tiller
+            kubectl create clusterrolebinding tiller --clusterrole cluster-admin --serviceaccount=kube-system:tiller
+            helm init --service-account tiller
+            # helm init --upgrade --force-upgrade
+            kubectl --namespace=kube-system rollout status deploy/tiller-deploy
+            # kubectl rollout status -w deployment/tiller-deploy --namespace=kube-system
+          fi
+          helm version
+          helm init
+          # Install CISE
+          if helm list cise | grep '^cise'; then
+            echo "Container Image Security Enforcement is already installed"
+          else
+            helm repo add iks-charts https://icr.io/helm/iks-charts
+            helm install --name cise iks-charts/ibmcloud-image-enforcement
+          fi
+          if [ -z "$REGISTRY_URL" ]; then
+            # Use the ibmcloud cr info to find the target registry url
+            export REGISTRY_URL=$(ibmcloud cr info | grep -m1 -i '^Container Registry' | awk '{print $3;}')
+          fi
+
+          cise_crd_template=$(cat <<'EOT'
+          apiVersion: securityenforcement.admission.cloud.ibm.com/v1beta1
+          kind: %s
+          metadata:
+            name: %s
+          spec:
+            repositories:
+            - name: %s
+              policy:
+                trust:
+                  enabled: %s
+                  signerSecrets:
+                  - name: %s
+                va:
+                  enabled: %s
+          EOT
+          )
+
+          createCISE_CRD() {
+            printf "$cise_crd_template" \
+            "ImagePolicy" \
+            "$REGISTRY_NAMESPACE.$IMAGE_NAME.$DEVOPS_SIGNER" \
+            "$REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME" \
+            "true" \
+            "$REGISTRY_NAMESPACE.$IMAGE_NAME.$DEVOPS_SIGNER" \
+            "true"
+          }
+
+          for signer_and_key in $(cat $ARTIFACTS/dct_signers.json | jq -r -c '.[] | {name:.Name, key: .Keys[0].ID}'); do
+            DEVOPS_SIGNER=$(echo $signer_and_key | jq -r '.name')
+            echo "CURRENT SIGNER= $DEVOPS_SIGNER"
+            createCISE_CRD | tee cise_crd_custom_policy.yaml
+            echo "Applying CISE custom policy to $CLUSTER_NAMESPACE"
+            kubectl apply -f cise_crd_custom_policy.yaml -n$CLUSTER_NAMESPACE
+          done
+
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+        - name: retry-command
+          mountPath: /scripts
+
+  workspaces:
+    - name: artifacts
+      mountPath: $(params.mount-path)
+
+  volumes:
+    - name: secrets
+      secret:
+        secretName: $(params.continuous-delivery-context-secret)
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

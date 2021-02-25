@@ -1,0 +1,58 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: pipeline-evidence-add
+spec:
+  workspaces:
+    - name: evidence-locker
+  params:
+    - name: evidence-repo-path
+    - name: namespace
+    - name: evidence-name
+    - name: evidence-type
+    - name: evidence-type-version
+    - name: result
+    - name: pipeline-debug
+    - name: ghe-token
+    - name: evidence-locker
+  tasks:
+    - name: setup
+      taskRef:
+        name: setup-evidence-add
+      workspaces:
+        - name: evidence-locker
+          workspace: evidence-locker
+      params:
+        - name: ghe-token
+          value: $(params.ghe-token)
+        - name: evidence-locker
+          value: $(params.evidence-locker)
+
+    - name: evidence-add-task
+      runAfter:
+        - setup
+      taskRef:
+        name: evidence-add
+      workspaces:
+        - name: evidence-locker
+          workspace: evidence-locker
+      params:
+        - name: evidence-repo-path
+          value: $(params.evidence-repo-path)
+        - name: namespace
+          value: $(params.namespace)
+        - name: evidence-name
+          value: $(params.evidence-name)
+        - name: evidence-type
+          value: $(params.evidence-type)
+        - name: evidence-type-version
+          value: $(params.evidence-type-version)
+        - name: result
+          value: $(params.result)
+        - name: issues
+          value: |
+            "https://github.ibm.com/cocoa/test-incident-issue-repo/issues/188"
+            "https://github.ibm.com/cocoa/test-incident-issue-repo/issues/90"
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)

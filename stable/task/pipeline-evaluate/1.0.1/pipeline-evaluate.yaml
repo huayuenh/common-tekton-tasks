@@ -1,0 +1,49 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: pipeline-evaluate
+  labels:
+    app.kubernetes.io/version: "1.0.1"
+spec:
+  params:
+    - name: results
+      description: |
+        The expected results to check in JSON format, e.g.:
+        [{
+          "name": "result-name",
+          "expected": "expected-value",
+          "actual": "actual-value"
+        }]
+
+  steps:
+    - name: evaluate-pipeline
+      image: python:3.8.6-alpine3.11@sha256:4b9149da5d775bdb86463135b2c044d96305623b60503d10e2da84ec5c40cfcf
+      env:
+        - name: PIPELINE_RUN_URL
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+      script: |
+          #!/usr/bin/env python3
+
+          import json, os
+
+          results = json.loads("""$(params.results)""")
+          pipeline_run_url = os.getenv("PIPELINE_RUN_URL")
+          url_parts = pipeline_run_url.split('?')
+
+          exit_code = 0
+          for result in results:
+            if result["actual"] != result["expected"]:
+              print("Task '" + result["name"] + "' has failed.")
+              print("The actual result value did not match expected value.")
+              print("Actual: '" + result["actual"] + "' | Expected: '" + result["expected"] + "'.")
+              link = url_parts[0] + '/' + result["name"] + '?' + url_parts[1]
+              print("Link to Task: " + link + "\n")
+              exit_code = 1
+
+          if exit_code == 0:
+            print("Every Task result passed the check!")
+
+          exit(exit_code)

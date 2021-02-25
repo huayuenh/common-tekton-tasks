@@ -1,0 +1,123 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: iks-contextual-execution
+spec:
+  params:
+    # As Cluster Pipeline Resources are not properly updated after kubernetes cluster setup
+    # Allow user to specify kubeconfig copy fallback directory provided by fetch-iks-cluster-context task
+    - name: cluster-pipeline-resources-directory
+      description: directory in which the kubeconfig file(s) for clusterPipelineResources are available
+      default: /clusters
+    - name: cluster-name
+      description: name of the cluster - required if no cluster pipeline resource provided to this task
+      default: ""
+    - name: script
+      description: the bash snippet to execute within the context of the kubernetes configuration
+      default: "kubectl version"
+    - name: retry-count
+      description: retry count to pull and push git evidence repo
+      default: "5"
+    - name: retry-delay
+      description: the amount of seconds between the retries
+      default: "30"
+    - name: pipeline-debug
+      default: "0"
+  workspaces:
+    - name: cluster-configuration
+      description: A workspace that contain the kubectl cluster config to be used
+      mountPath: /clusterconfig
+  steps:
+    - name: execute
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      workingDir: $(workspaces.cluster-configuration.path)
+      env:
+        - name: PIPELINE_DEBUG
+          value: $(params.pipeline-debug)
+        # CD execution context injection
+        - name: PIPELINE_RUN_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['tekton.dev/pipelineRun']
+        - name: PIPELINE_RUN_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+        - name: PIPELINE_RUN_URL
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-run-url']
+        - name: BUILD_NUMBER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/build-number']
+        - name: PIPELINE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-id']
+        - name: TRIGGER_TYPE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/trigger-type']
+        - name: TRIGGER_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/trigger-name']
+        - name: TRIGGERED_BY
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/triggered-by']
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          if [ $PIPELINE_DEBUG == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+          fi
+
+          source /scripts/retry_command.sh
+
+          # Find cluster information
+          export CLUSTER_NAME="$(params.cluster-name)"
+          export KUBECONFIG="/clusterconfig/$(params.cluster-pipeline-resources-directory)/$CLUSTER_NAME/kubeconfig"
+
+          # Validate KUBECONFIG
+          if test -f "$KUBECONFIG"; then
+            echo "KUBECONFIG=$KUBECONFIG"
+          else
+            echo "$KUBECONFIG file is not existing. Exiting now..."
+            exit 1
+          fi
+          # User-defined snippet/script which will be retried
+
+          retry $(params.retry-count) $(params.retry-delay) $(params.script)
+
+          exit_code=$?
+
+          if [ $exit_code -ne 0 ]; then
+            echo "Error running contextual script on cluster: $(params.cluster-name)"
+            exit $exit_code
+          fi
+
+      volumeMounts:
+        - name: cd-config-volume
+          mountPath: /cd-config
+        - name: retry-command
+          mountPath: /scripts
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: retry-command
+      configMap:
+        name: retry-command
+        items:
+          - key: retry_command.sh
+            path: retry_command.sh

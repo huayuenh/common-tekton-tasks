@@ -1,0 +1,106 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: compliance-unit-test
+  labels:
+    tekton.dev/deprecated: true
+spec:
+  params:
+    - name: context
+      description: the context of the unit tests
+    - name: repository
+      description: name of the git repository
+      default: ""
+    - name: git-commit
+      description: the commit id where the status will be set
+      default: ""
+    - name: app-directory
+      description: path of the application
+      default: ""
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+
+  stepTemplate:
+    env:
+      - name: PIPELINE_DEBUG
+        value: $(params.pipeline-debug)
+
+  steps:
+    - name: unit-tests
+      image: ibmcom/pipeline-base-image:2.6
+      env:
+        - name: CONTEXT
+          value: $(params.context)
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          . /root/.nvm/nvm.sh
+
+          if [ $PIPELINE_DEBUG == 1 ]; then
+            env
+            cat /cd-config/toolchain.json
+            trap env EXIT
+            set -x
+          fi
+
+          function set-status() {
+            local repo=$1
+            local state=$2
+            local context=$3
+            local description=$4
+            local body="{\"state\": \"$state\", \"target_url\": \"$TOOLCHAIN_URL\",\
+            \"description\": \"$description\", \"context\": \"$context\"}"
+
+            curl "https://github.ibm.com/api/v3/repos/$repo/statuses/$GIT_COMMIT" \
+              -H "Authorization: Bearer $GHE_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$body"
+          }
+
+          source /artifacts/build.properties
+
+          if [ -n "$(params.app-directory)" ]; then
+            export APP_DIRECTORY=$(params.app-directory)
+          fi
+
+          if [ -n "$(params.git-commit)" ]; then
+            export GIT_COMMIT=$(params.git-commit)
+          fi
+
+          if [ -n "$(params.repository)" ]; then
+            export REPO=$(params.repository)
+          fi
+
+          GH_ORG=$(jq -r '.services[] | select(.toolchain_binding.name=="app-repo") |
+          .parameters.owner_id' /cd-config/toolchain.json)
+          TOOLCHAIN_ID=$(jq -r '.toolchain_guid' /cd-config/toolchain.json)
+          TOOLCHAIN_REGION=$(jq -r '.region_id' /cd-config/toolchain.json)
+          TOOLCHAIN_URL="https://cloud.ibm.com/devops/toolchains/$TOOLCHAIN_ID?env_id=$TOOLCHAIN_REGION"
+
+          set-status $GH_ORG/$REPO pending $CONTEXT
+
+          cd /artifacts/$APP_DIRECTORY
+          npm ci
+
+          if npm test; then
+            set-status $GH_ORG/$REPO success $CONTEXT
+          else
+            set-status $GH_ORG/$REPO failure $CONTEXT
+          fi
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+
+  workspaces:
+    - name: artifacts
+      mountPath: /artifacts
+
+  volumes:
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json

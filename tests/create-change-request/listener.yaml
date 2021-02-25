@@ -1,0 +1,11 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: listener-create-change-request
+spec:
+  triggers:
+    - binding:
+        name: binding-create-change-request
+      template:
+        name: template-create-change-request

@@ -1,0 +1,11 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: listener-create-incident-issue
+spec:
+  triggers:
+    - binding:
+        name: binding-create-incident-issue
+      template:
+        name: template-create-incident-issue
