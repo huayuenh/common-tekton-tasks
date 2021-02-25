@@ -389,8 +389,11 @@ spec:
 
           # Delete files from our staging sigstore
           echo "show content"
-          ls /var/lib/containers/sigstore/
+          PATH=$(pwd)
+          cd /var/lib/containers/sigstore/
+          ls
           ls /tmp/
+          cd $PATH
           rm -rf /var/lib/containers/sigstore/*
 
           echo "Pull signed image"
