@@ -213,6 +213,63 @@ spec:
             echo -n "$(params.evidence)" | tee "$(results.signature.path)"
           fi
 
+    - name: artifactory-prepare-environment-for-signing
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-image:2.6@sha256:7f588468622a981f89cf5e1212aaf75fface9da6169b5345ca52ab63d8215907
+      env:
+        - name: ARTIFACTORY_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.taas-artifactory-api-token-secret-key)
+        - name: ARTIFACTORY_PRIMARY_SERVICE
+          value: $(params.artifactory-primary-service)
+        - name: ARTIFACTORY_DOCKER_REPO_NAME
+          value: $(params.artifactory-docker-repo-name)
+        - name: ARTIFACTORY_SIGSTORE_REPO_NAME
+          value: $(params.artifactory-sigstore-repo-name)
+      volumeMounts:
+        - mountPath: /secrets
+          name: secrets
+        - mountPath: /signing-files
+          name: signing-files
+        - mountPath: /steps
+          name: steps-volume
+      script: |
+          #!/bin/bash
+          set +e
+
+          if [[ "$ARTIFACTORY_SIGNING" -eq 0 ]]; then
+            echo "Step skipped."
+            exit 0;
+          fi
+
+          export ARTIFACTORY_BASE_URL="https://${ARTIFACTORY_PRIMARY_SERVICE}.artifactory.swg-devops.com/artifactory"
+          export ARTIFACTORY_DOCKER_REPO_URL="${ARTIFACTORY_DOCKER_REPO_NAME}.artifactory.swg-devops.com"
+          export ARTIFACTORY_SIGSTORE_REPO_URL="${ARTIFACTORY_PRIMARY_SERVICE}.artifactory.swg-devops.com/artifactory/${ARTIFACTORY_SIGSTORE_REPO_NAME}"
+          export PUBLIC_KEY_FILE="/signing-files/public-key.pub"
+
+          echo "Creating artifactory.yaml from template (for use at /etc/containers/registries.d/artifactory.yaml)..."
+
+          yq n docker[$ARTIFACTORY_DOCKER_REPO_URL].sigstore https://${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}@${ARTIFACTORY_SIGSTORE_REPO_URL} > tmp.yaml
+          yq w tmp.yaml docker[$ARTIFACTORY_DOCKER_REPO_URL].sigstore-staging file:///var/lib/containers/sigstore > /signing-files/artifactory.yaml
+
+          cat /signing-files/artifactory.yaml
+
+          jq -n '{default: [{type: $type}], transports: { "docker-daemon": {"": [{type: $type}]}, docker: { ($url): [{type: $signed, keyType: $keytype, keyPath: $keyPath}]}}}' \
+          --arg type insecureAcceptAnything \
+          --arg url "$ARTIFACTORY_DOCKER_REPO_URL" '.[$url]' \
+          --arg signed signedBy \
+          --arg keytype GPGKeys \
+          --arg keyPath $PUBLIC_KEY_FILE > /signing-files/policy.json
+
+          cat /signing-files/policy.json
+
+          echo "ARTIFACTORY_DOCKER_REPO_URL=${ARTIFACTORY_DOCKER_REPO_URL}" >> /steps/next-step-env.properties
+          echo "ARTIFACTORY_BASE_URL=${ARTIFACTORY_BASE_URL}" >> /steps/next-step-env.properties
+          echo "ARTIFACTORY_SIGSTORE_REPO_URL=${ARTIFACTORY_SIGSTORE_REPO_URL}" >> /steps/next-step-env.properties
+          echo "PUBLIC_KEY_FILE=${PUBLIC_KEY_FILE}" >> /steps/next-step-env.properties
+
+
   workspaces:
     - name: artifacts
       description: A workspace backing by a volume
