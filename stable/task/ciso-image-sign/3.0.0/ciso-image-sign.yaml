@@ -269,6 +269,137 @@ spec:
           echo "ARTIFACTORY_SIGSTORE_REPO_URL=${ARTIFACTORY_SIGSTORE_REPO_URL}" >> /steps/next-step-env.properties
           echo "PUBLIC_KEY_FILE=${PUBLIC_KEY_FILE}" >> /steps/next-step-env.properties
 
+    - name: artifactory-sign-image
+      image: wcp-compliance-automation-team-docker-local.artifactory.swg-devops.com/code-signing-agent:1.0.0@sha256:1a77f8002ff5e0f35bfaab52ed1dd93b1ca2277987e7dd5941b64afa3527451d
+      env:
+        # Ask the jfrog CLI not to offer alternative config options
+        - name: JFROG_CLI_OFFER_CONFIG
+          value: "false"
+        - name: ARTIFACTORY_USER
+          value: $(params.taas-artifactory-user)
+        - name: ARTIFACTORY_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.taas-artifactory-api-token-secret-key)
+        - name: ARTIFACTORY_PRIMARY_SERVICE
+          value: $(params.artifactory-primary-service)
+        - name: ARTIFACTORY_DOCKER_REPO_NAME
+          value: $(params.artifactory-docker-repo-name)
+        - name: ARTIFACTORY_SIGSTORE_REPO_NAME
+          value: $(params.artifactory-sigstore-repo-name)
+      volumeMounts:
+        - mountPath: /secrets
+          name: secrets
+        - mountPath: /signing-files
+          name: signing-files
+        - mountPath: /var/lib/containers/sigstore
+          name: sigstore
+        - mountPath: /steps
+          name: steps-volume
+        - mountPath: /image-storage
+          name: image-storage
+      # yamllint disable rule:line-length
+      script: |
+          #!/bin/bash
+          set -x
+
+          if [[ "$ARTIFACTORY_SIGNING" -eq 0 ]]; then
+            echo "Step skipped."
+            exit 0;
+          fi
+
+          source /steps/next-step-env.properties
+
+          skopeo copy \
+              docker://"${IMAGE}" \
+              dir:/image-storage \
+              --dest-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}" \
+              --src-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}"
+
+          cp -p /signing-files/artifactory.yaml  /etc/containers/registries.d/artifactory.yaml
+          cp -p /signing-files/policy.json /etc/containers/policy.json
+
+          echo "Generating PFX file from secret"
+          echo -n "${VAULT_SECRET}" | base64 --decode > /signing-files/temp.pfx
+          chmod 644 /signing-files/temp.pfx
+
+          cp -p /signing-files/temp.pfx /etc/ekm/temp.pfx
+
+          #extract alias
+          ALIAS=$(ucl list | grep -m 1 Private)
+          if [[ "$ALIAS" ]]; then
+            echo "Certificate found"
+          else
+            STR=$(ucl list)
+            if grep -q "Error" <<< "$STR"; then
+              echo "Cannot access CISO partition."
+              echo "Ensure that CISO account has been setup and that the client key secret is correct"
+            else
+              echo "Ensure that your CISO partition has a signing certifcate provisioned"
+            fi
+          fi
+          ALIAS=${ALIAS#*"UID="}
+          ALIAS=$(echo $ALIAS | head -n1 | sed -e 's/\s.*$//')
+          echo "Alias: $ALIAS"
+
+          gpgconf --kill all
+          ucl pgp-key -u ${ALIAS}
+          FINGERPRINT=$(gpg2 -k)
+          FINGERPRINT=${FINGERPRINT#*"[SCEA]"}
+          FINGERPRINT=$(echo $FINGERPRINT | head -n1 | sed -e 's/\s.*$//')
+          gpg2 --armor --output ${PUBLIC_KEY_FILE} --export ${FINGERPRINT}
+
+          skopeo copy \
+              dir:/image-storage \
+              docker://"${IMAGE}" \
+              --dest-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}" \
+              --remove-signatures \
+              --src-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}" \
+              --sign-by "${FINGERPRINT}"
+
+          echo "Upload Signature"
+          # Ensure there is only one signature folder in the staging sigstore
+          NUMBER_OF_FILES=$(ls -1 /var/lib/containers/sigstore | wc -l)
+          if [ "$NUMBER_OF_FILES" -ne 1 ]; then
+              echo "Expected one file in /var/lib/containers/sigstore but found $NUMBER_OF_FILES files, aborting upload of signature for security. Exiting."
+              exit 1
+          fi
+
+          # Create a zip file containing only the file structure within the staging sigstore
+          cd /var/lib/containers/sigstore/; zip -r /tmp/upload-sig-to-artifactory.zip ./*; cd -
+          # Upload the zip file to Artifactory and explode it to replicate the same structure
+          jfrog rt u --explode --user "${ARTIFACTORY_USER}" --apikey "${ARTIFACTORY_API_KEY}" --url "${ARTIFACTORY_BASE_URL}" "/tmp/upload-sig-to-artifactory.zip" "${ARTIFACTORY_SIGSTORE_REPO_NAME}"
+
+          # Delete files from our staging sigstore
+          rm -rf /var/lib/containers/sigstore/*
+
+          echo "Pull signed image"
+          skopeo copy \
+            --src-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}" \
+            docker://"${IMAGE}" \
+            dir:/tmp/image-signed
+
+          PASS=$?
+          echo $PASS | tee $(results.exit-code.path)
+
+          if [ "$PASS" == 0 ]; then
+            echo -n success | tee "$(results.status.path)"
+            cd /tmp/image-signed
+            SIGNATURE_DATA=$(cat signature-1 | base64 -w 0)
+            cd ..
+            cd /artifacts
+            echo "${SIGNATURE_DATA}" > "$(params.evidence)"
+            echo -n "$(params.evidence)" | tee "$(results.signature.path)"
+
+            SIGNATURE_CONTENT="${SIGNATURE_DATA}"
+            echo -n "${SIGNATURE_CONTENT}" | tee "$(results.signature-content.path)"
+          else
+            echo -n failure | tee "$(results.status.path)"
+            echo {} > "$(params.evidence)"
+            echo -n "$(params.evidence)" | tee "$(results.signature.path)"
+            echo -n "" | tee "$(results.signature-content.path)"
+          fi
 
   workspaces:
     - name: artifacts
