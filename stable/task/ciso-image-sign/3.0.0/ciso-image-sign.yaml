@@ -363,11 +363,11 @@ spec:
           FINGERPRINT=${FINGERPRINT#*"[SCEA]"}
           FINGERPRINT=$(echo $FINGERPRINT | head -n1 | sed -e 's/\s.*$//')
           gpg2 --armor --output ${PUBLIC_KEY_FILE} --export ${FINGERPRINT}
-
+          DESTINATION="wcp-delorean-team-docker-local.artifactory.swg-devops.com/myimage_signed:latest"
           #ls /image-storage
           skopeo copy \
               dir:/image-storage \
-              docker://"${IMAGE}" \
+              docker://"${DESTINATION}" \
               --dest-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}" \
               --remove-signatures \
               --src-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}" \
@@ -392,7 +392,7 @@ spec:
           echo "Pull signed image"
           skopeo copy \
             --src-creds "${ARTIFACTORY_USER}:${ARTIFACTORY_API_KEY}" \
-            docker://"${IMAGE}" \
+            docker://"${DESTINATION}" \
             dir:/tmp/image-signed
 
           PASS=$?
